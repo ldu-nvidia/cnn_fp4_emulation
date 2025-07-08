@@ -1,0 +1,3 @@
+[submodule "kitchen"]
+	path = kitchen
+	url = https://gitlab-master.nvidia.com/compute/chef/kitchen
