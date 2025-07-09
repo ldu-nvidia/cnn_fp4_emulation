@@ -1,26 +1,25 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# Helper: Conv Block
+# Helper: FP16-safe Conv Block with GroupNorm
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, groups=8):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=False),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=False)
         )
 
     def forward(self, x):
         return self.block(x)
 
-# UNet with float16 support
+# UNet model with GroupNorm and AMP-safe layers
 class UNetFP16(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1):
+    def __init__(self, in_channels=3, out_channels=80):
         super().__init__()
 
         self.enc1 = ConvBlock(in_channels, 64)
@@ -52,7 +51,7 @@ class UNetFP16(nn.Module):
         self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
 
     def forward(self, x):
-        x = x.half()  # ensure input is FP16
+        # Do NOT cast to FP16 manually — use autocast externally during training
         enc1 = self.enc1(x)
         enc2 = self.enc2(self.pool1(enc1))
         enc3 = self.enc3(self.pool2(enc2))
@@ -75,4 +74,4 @@ class UNetFP16(nn.Module):
         dec1 = torch.cat((enc1, dec1), dim=1)
         dec1 = self.dec1(dec1)
 
-        return self.out_conv(dec1).half()  # keep output in FP16
+        return self.out_conv(dec1)
