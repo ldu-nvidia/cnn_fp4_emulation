@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from pycocotools import mask as coco_mask
 from torchvision.transforms.functional import resize, InterpolationMode
 
@@ -19,26 +20,32 @@ def rename(old_name):
     return new_name
 
 # --- Mask/Target Parsing Utilities ---
-def parse_segmentation_masks(targets, height, width, num_classes):
+def parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx):
     batch_masks = []
     for anns in targets:
         mask = torch.zeros((num_classes, height, width), dtype=torch.float32)
         for ann in anns:
-            if 'segmentation' in ann:
-                category_id = ann['category_id']
-                if category_id >= num_classes:
-                    continue
-                rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
-                m = torch.tensor(coco_mask.decode(rle), dtype=torch.float32)
-                if m.ndim == 3:
-                    m = m.any(dim=-1)
-                m = m.unsqueeze(0)
-                m = resize(m, size=(height, width), interpolation=InterpolationMode.NEAREST)
-                m = m.squeeze(0)
-                mask[category_id] = torch.max(mask[category_id], m)
-        batch_masks.append(mask)
+            if 'segmentation' not in ann:
+                continue
 
+            coco_cat_id = ann['category_id']
+            if coco_cat_id not in category_id_to_class_idx:
+                continue
+
+            class_idx = category_id_to_class_idx[coco_cat_id]
+
+            rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
+            m = coco_mask.decode(rle)  # shape: [height, width] or [height, width, N]
+
+            if m.ndim == 3:
+                m = np.any(m, axis=2)  # collapse multiple masks
+
+            m_tensor = torch.tensor(m, dtype=torch.float32)
+            mask[class_idx] = torch.max(mask[class_idx], m_tensor)
+
+        batch_masks.append(mask)
     return torch.stack(batch_masks)
+
 
 def parse_instance_masks(targets, height, width):
     batch_masks = []

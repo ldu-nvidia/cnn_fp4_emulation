@@ -13,5 +13,6 @@ def configs():
     parser.add_argument('--log_weights', type=bool, default=True)
     parser.add_argument('--log_grads', type=bool, default=False)
     parser.add_argument("--visualize_val", type=bool, default=True)
+    parser.add_argument('--debug', type=bool, default=True, help="debug mode, terminate early to make sure everything works")
     args = parser.parse_args()
     return args

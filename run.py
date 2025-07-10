@@ -42,56 +42,84 @@ class DiceLoss(nn.Module):
 
 class reduced_precision_trainer():
     def __init__(self, args):
-        self.layer_stats = []
+        self.layer_stats_w = []
+        self.layer_stats_grad = []
         self.args = args
 
     def log_telemetry(self, model, loss_value, step):
+        if step % self.args.logf != 0:
+            return
+        
+        stat_dict_w, stat_dict_grad, stat_dict_a = {}, {}, {}
         if not np.isfinite(loss_value):
             print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
             return
         wandb.log({"loss": loss_value}, step=step)
-        if step % self.args.logf != 0:
-            return
-        stat_dict = {}
+
         for name, param in model.named_parameters():
             new_name = rename(name)
+            print(new_name)
+
             if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
                 w = param.detach().cpu().float().numpy().flatten()
                 if np.isfinite(w).all():
-                    stat_dict[new_name + "/mean"] = np.mean(w)
-                    stat_dict[new_name + "/std"] = np.std(w)
-                    stat_dict[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
+                    stat_dict_w[new_name + "/mean"] = np.mean(w)
+                    stat_dict_w[new_name + "/std"] = np.std(w)
+                    if np.std(w) > 1e-6:
+                        stat_dict_w[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
+                    else:
+                        stat_dict_w[new_name + "/kurtosis"] = 0.0  
                     wandb.log({new_name: wandb.Histogram(w)}, step=step)
-        stat_dict['step'] = step
-        self.layer_stats.append(stat_dict)
 
-    def save_layer_stats(self, output_path="layer_stats.json"):
+            if param.requires_grad and 'bias' not in new_name and 'grad' in new_name:
+                w = param.detach().cpu().float().numpy().flatten()
+                if np.isfinite(w).all():
+                    stat_dict_grad[new_name + "/mean"] = np.mean(w)
+                    stat_dict_grad[new_name + "/std"] = np.std(w)
+                    if np.std(w) > 1e-6:
+                        stat_dict_grad[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
+                    else:
+                        stat_dict_grad[new_name + "/kurtosis"] = 0.0
+                    wandb.log({new_name: wandb.Histogram(w)}, step=step)
+
+        stat_dict_w['step'], stat_dict_grad['step'] = step, step
+        self.layer_stats_w.append(stat_dict_w)
+        self.layer_stats_grad.append(stat_dict_grad)
+
+    def save_layer_stats(self):
+        output_paths=["weights_layer_stats.json", "grads_layer_stats.json"]
         os.makedirs("plots", exist_ok=True)
-        with open("plots/" + output_path, "w") as f:
-            json.dump(self.layer_stats, f)
+        for outpath, layer_stats in zip(output_paths, [self.layer_stats_w, self.layer_stats_grad]):
+            with open("plots/" + outpath, "w") as f:
+                serializable_stats = [
+                    {k: float(v) if isinstance(v, (np.floating, np.float32, np.float64)) else v for k, v in entry.items()}
+                    for entry in layer_stats
+                ]
+                json.dump(serializable_stats, f)
+                assert outpath in os.listdir('plots/')
         print("✅ Layer stats saved to plot folder")
 
     def finalize_and_visualize(self):
         if not self.layer_stats:
             return
-
         self.save_layer_stats()
-        keys = sorted(k for k in self.layer_stats[0].keys() if k != 'step')
-        steps = [stat['step'] for stat in self.layer_stats]
-        tensor = np.zeros((len(steps), len(keys) // 3, 3))
-        layer_names = []
-        for i, k in enumerate(keys):
-            base = k.rsplit('/', 1)[0]
-            if base not in layer_names:
-                layer_names.append(base)
-        stat_map = {'mean': 0, 'std': 1, 'kurtosis': 2}
-        for i, entry in enumerate(self.layer_stats):
-            for k, v in entry.items():
-                if k == 'step': continue
-                base, stat = k.rsplit('/', 1)
-                tensor[i, layer_names.index(base), stat_map[stat]] = v
-        plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.args.logf)
-        plot_interactive_3d(tensor, layer_names, list(stat_map.keys()))
+        for layer_stats, type in zip([self.layer_stats_w, self.layer_stats_grad], ['weights', 'grads']):
+            keys = sorted(k for k in layer_stats[0].keys() if k != 'step')
+            steps = [stat['step'] for stat in layer_stats]
+            tensor = np.zeros((len(steps), len(keys) // 3, 3))
+            layer_names = []
+            for i, k in enumerate(keys):
+                base = k.rsplit('/', 1)[0]
+                if base not in layer_names:
+                    layer_names.append(base)
+            stat_map = {'mean': 0, 'std': 1, 'kurtosis': 2}
+            for i, entry in enumerate(layer_stats):
+                for k, v in entry.items():
+                    if k == 'step': continue
+                    base, stat = k.rsplit('/', 1)
+                    tensor[i, layer_names.index(base), stat_map[stat]] = v
+            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.args, type)
+            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.args, type)
 
     def train_one_epoch(self, model, dataloader, ce_criterion, dice_crition, optimizer, device, step_start, task, num_classes, scaler):
         model.train()
@@ -104,7 +132,7 @@ class reduced_precision_trainer():
                 height, width = outputs.shape[2:]
 
                 if task == "segmentation":
-                    gt = parse_segmentation_masks(targets, height, width, num_classes).to(device)
+                    gt = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).to(device)
                 elif task == "detection":
                     gt = parse_detection_heatmap(targets, height, width).to(device)
                 elif task == "instance":
@@ -132,6 +160,8 @@ class reduced_precision_trainer():
             if self.args.enable_logging:
                 self.log_telemetry(model, loss.item(), step)
             step += 1
+            if step == 100:
+                break
         return running_loss / len(dataloader), step
 
     def validate(self, model, dataloader, ce_criterion, dice_crition, device, step_start, task, num_classes):
@@ -146,7 +176,7 @@ class reduced_precision_trainer():
                     height, width = outputs.shape[2:]
 
                     if task == "segmentation":
-                        gt = parse_segmentation_masks(targets, height, width, num_classes).to(device)
+                        gt = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).to(device)
                     elif task == "detection":
                         gt = parse_detection_heatmap(targets, height, width).to(device)
                     elif task == "instance":
@@ -165,6 +195,8 @@ class reduced_precision_trainer():
                     val_loss += loss.item()
                     wandb.log({"val/loss": loss.item()}, step=step)
                     step += 1
+                    if step == step_start + 20:
+                        break
         
         if self.args.enable_logging and self.args.visualize_val:
             self.log_visual_predictions(model, dataloader, num_samples=4, device=device, num_classes=num_classes)
@@ -217,6 +249,11 @@ class reduced_precision_trainer():
         dataset = CocoDetection(root=self.args.coco_root,
                                 annFile=self.args.ann_file,
                                 transform=transform)
+        
+        coco = COCO(args.ann_file)
+        category_ids = sorted(coco.getCatIds())  # just get all category IDs
+        self.category_id_to_class_idx = {cat_id: idx for idx, cat_id in enumerate(category_ids)}
+        num_classes = len(self.category_id_to_class_idx)
 
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -228,7 +265,6 @@ class reduced_precision_trainer():
             train_loader = DataLoader(train_subset, batch_size=self.args.batch_size, shuffle=True, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
             val_loader = DataLoader(val_subset, batch_size=self.args.batch_size, shuffle=False, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
 
-            num_classes = get_max_category_id(dataset) + 1
             print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
 
             model = UNetFP16(in_channels=3, out_channels=num_classes).to(device)
