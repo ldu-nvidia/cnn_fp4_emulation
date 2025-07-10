@@ -14,7 +14,9 @@ from torch.amp import autocast, GradScaler
 import scipy.stats
 import json
 from config import configs
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 from models.baseline import UNetFP16  # <- make sure this supports out_channels
 from visualize import plot_grid_heatmaps, plot_interactive_3d
 from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, coco_collate_fn, count_parameters, get_max_category_id, combined_loss
@@ -163,7 +165,45 @@ class reduced_precision_trainer():
                     val_loss += loss.item()
                     wandb.log({"val/loss": loss.item()}, step=step)
                     step += 1
+        
+        if self.args.enable_logging and self.args.visualize_val:
+            self.log_visual_predictions(model, dataloader, num_samples=4, device=device, num_classes=num_classes)
         return val_loss / len(dataloader), step
+
+    def log_visual_predictions(self, model, dataloader, num_samples, device, num_classes):
+        model.eval()
+        class_colors = plt.cm.get_cmap("tab20", num_classes)
+        samples_logged = 0
+        with torch.no_grad():
+            for images, targets in dataloader:
+                images = images.to(device)
+                outputs = model(images)
+                preds = torch.argmax(outputs, dim=1).cpu()
+                height, width = preds.shape[1:]
+
+                gt_masks = parse_segmentation_masks(targets, height, width, num_classes).argmax(1).cpu()
+
+                for i in range(min(len(images), num_samples - samples_logged)):
+                    img_np = TF.to_pil_image(images[i].cpu())
+                    pred_mask = preds[i].numpy()
+                    gt_mask = gt_masks[i].numpy()
+
+                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+                    axes[0].imshow(img_np)
+                    axes[0].set_title("Input Image")
+                    axes[1].imshow(img_np)
+                    axes[1].imshow(pred_mask, alpha=0.5, cmap='jet')
+                    axes[1].set_title("Predicted Mask")
+                    axes[2].imshow(img_np)
+                    axes[2].imshow(gt_mask, alpha=0.5, cmap='jet')
+                    axes[2].set_title("Ground Truth Mask")
+                    for ax in axes: ax.axis("off")
+                    fig.tight_layout()
+                    wandb.log({f"vis/sample_{samples_logged}": wandb.Image(fig)})
+                    plt.close(fig)
+                    samples_logged += 1
+                    if samples_logged >= num_samples:
+                        return
 
     def run(self):
         if self.args.enable_logging: 
