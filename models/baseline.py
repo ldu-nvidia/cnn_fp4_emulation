@@ -5,6 +5,7 @@ import torch.nn as nn
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, groups=8):
         super().__init__()
+        # groups x groups is the number of pixels used to calculate statistics
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.GroupNorm(groups, out_channels),
@@ -21,34 +22,36 @@ class ConvBlock(nn.Module):
 class UNetFP16(nn.Module):
     def __init__(self, in_channels=3, out_channels=80):
         super().__init__()
+        self.scale = 0.25
 
-        self.enc1 = ConvBlock(in_channels, 64)
+        # channel size double
+        self.enc1 = ConvBlock(in_channels, int(self.scale*64))
         self.pool1 = nn.MaxPool2d(2)
 
-        self.enc2 = ConvBlock(64, 128)
+        self.enc2 = ConvBlock(int(self.scale*64), int(self.scale*128))
         self.pool2 = nn.MaxPool2d(2)
 
-        self.enc3 = ConvBlock(128, 256)
+        self.enc3 = ConvBlock(int(self.scale*128), int(self.scale*256))
         self.pool3 = nn.MaxPool2d(2)
 
-        self.enc4 = ConvBlock(256, 512)
+        self.enc4 = ConvBlock(int(self.scale*256), int(self.scale*512))
         self.pool4 = nn.MaxPool2d(2)
 
-        self.bottleneck = ConvBlock(512, 1024)
+        self.bottleneck = ConvBlock(int(self.scale*512), int(self.scale*1024))
 
-        self.upconv4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
-        self.dec4 = ConvBlock(1024, 512)
+        self.upconv4 = nn.ConvTranspose2d(int(self.scale*1024), int(self.scale*512), kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(int(self.scale*1024), int(self.scale*512))
 
-        self.upconv3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(512, 256)
+        self.upconv3 = nn.ConvTranspose2d(int(self.scale*512), int(self.scale*256), kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(int(self.scale*512), int(self.scale*256))
 
-        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(256, 128)
+        self.upconv2 = nn.ConvTranspose2d(int(self.scale*256), int(self.scale*128), kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(int(self.scale*256), int(self.scale*128))
 
-        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(128, 64)
+        self.upconv1 = nn.ConvTranspose2d(int(self.scale*128), int(self.scale*64), kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(int(self.scale*128), int(self.scale*64))
 
-        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.out_conv = nn.Conv2d(int(self.scale*64), out_channels, kernel_size=1)
 
     def forward(self, x):
         # Do NOT cast to FP16 manually — use autocast externally during training

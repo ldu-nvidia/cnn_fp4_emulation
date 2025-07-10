@@ -9,135 +9,95 @@ import os
 import argparse
 import wandb
 import numpy as np
-from torchvision.transforms.functional import resize, InterpolationMode
 from pycocotools import mask as coco_mask
-from torch.cuda.amp import autocast, GradScaler
-
+from torch.amp import autocast, GradScaler
+import scipy.stats
+import json
+from config import configs
+import torch.nn.functional as F
 from models.baseline import UNetFP16  # <- make sure this supports out_channels
+from visualize import plot_grid_heatmaps, plot_interactive_3d
+from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, coco_collate_fn, count_parameters, get_max_category_id, combined_loss
 
-# --- Collate function for COCO ---
-def coco_collate_fn(batch):
-    images, targets = zip(*batch)
-    images = torch.stack(images, dim=0)
-    return images, list(targets)
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0):
+        super().__init__()
+        self.smooth = smooth
 
-# --- Mask/Target Parsing Utilities ---
-def parse_segmentation_masks(targets, height, width, num_classes):
-    batch_masks = []
-    for anns in targets:
-        mask = torch.zeros((num_classes, height, width), dtype=torch.float32)
-        for ann in anns:
-            if 'segmentation' in ann:
-                category_id = ann['category_id']
-                if category_id >= num_classes:
-                    continue
-                rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
-                m = torch.tensor(coco_mask.decode(rle), dtype=torch.float32)
-                if m.ndim == 3:
-                    m = m.any(dim=-1)
-                m = m.unsqueeze(0)
-                m = resize(m, size=(height, width), interpolation=InterpolationMode.NEAREST)
-                m = m.squeeze(0)
-                mask[category_id] = torch.max(mask[category_id], m)
-        batch_masks.append(mask)
+    def forward(self, logits, targets):
+        assert logits.ndim == 4, f"logits must be 4D, got {logits.shape}"
+        assert targets.ndim == 4, f"targets must be 4D (one-hot), got {targets.shape}"
+        assert logits.shape == targets.shape, f"Shape mismatch: logits {logits.shape}, targets {targets.shape}"
 
-    return torch.stack(batch_masks)
+        probs = F.softmax(logits, dim=1)
+        targets = targets.float()
 
-def parse_instance_masks(targets, height, width):
-    batch_masks = []
-    for anns in targets:
-        mask = torch.zeros((len(anns), height, width), dtype=torch.float32)
-        for i, ann in enumerate(anns):
-            if 'segmentation' in ann:
-                rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
-                m = torch.tensor(coco_mask.decode(rle), dtype=torch.float32)
-                m = m if m.ndim == 2 else m.any(dim=-1)
-                mask[i] = m
-        batch_masks.append(mask)
-    return batch_masks
+        intersection = torch.sum(probs * targets, dim=(2, 3))
+        union = torch.sum(probs + targets, dim=(2, 3))
 
-def parse_detection_heatmap(targets, height, width, num_classes=80):
-    batch_heatmaps = []
-    for anns in targets:
-        heatmap = torch.zeros((num_classes, height, width), dtype=torch.float32)
-        for ann in anns:
-            cat = ann['category_id'] - 1
-            x, y, w, h = ann['bbox']
-            cx = int(x + w / 2)
-            cy = int(y + h / 2)
-            if 0 <= cx < width and 0 <= cy < height:
-                heatmap[cat, cy, cx] = 1.0
-        batch_heatmaps.append(heatmap)
-    return torch.stack(batch_heatmaps)
+        dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
+        return 1.0 - dice_score.mean()
 
-# --- Telemetry Logging ---
-def log_telemetry(model, loss_value, step):
-    if not np.isfinite(loss_value):
-        print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
-        return
-    wandb.log({"loss": loss_value}, step=step)
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            weights = param.detach().cpu().numpy().flatten()
-            grads = param.grad.detach().cpu().numpy().flatten() if param.grad is not None else None
-            if np.isfinite(weights).all():
-                wandb.log({f"weights/{name}": wandb.Histogram(weights)}, step=step)
-            if grads is not None and np.isfinite(grads).all():
-                wandb.log({f"grads/{name}": wandb.Histogram(grads)}, step=step)
+class reduced_precision_trainer():
+    def __init__(self, args):
+        self.layer_stats = []
+        self.args = args
 
-# --- Epoch Training ---
-def train_one_epoch(model, dataloader, criterion, optimizer, device, step_start, task, num_classes, scaler):
-    model.train()
-    running_loss = 0.0
-    step = step_start
-    for images, targets in dataloader:
-        images = images.to(device)
-        print("this is step: ", step + 1)
-        #print("this is input image batch: ", images)
+    def log_telemetry(self, model, loss_value, step):
+        if not np.isfinite(loss_value):
+            print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
+            return
+        wandb.log({"loss": loss_value}, step=step)
+        if step % self.args.logf != 0:
+            return
+        stat_dict = {}
+        for name, param in model.named_parameters():
+            new_name = rename(name)
+            if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
+                w = param.detach().cpu().float().numpy().flatten()
+                if np.isfinite(w).all():
+                    stat_dict[new_name + "/mean"] = np.mean(w)
+                    stat_dict[new_name + "/std"] = np.std(w)
+                    stat_dict[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
+                    wandb.log({new_name: wandb.Histogram(w)}, step=step)
+        stat_dict['step'] = step
+        self.layer_stats.append(stat_dict)
 
-        with autocast(dtype=torch.float16):
-            outputs = model(images)
-            #print("this is model output: ", outputs)
-            height, width = outputs.shape[2:]
+    def save_layer_stats(self, output_path="layer_stats.json"):
+        os.makedirs("plots", exist_ok=True)
+        with open("plots/" + output_path, "w") as f:
+            json.dump(self.layer_stats, f)
+        print("✅ Layer stats saved to plot folder")
 
-            if task == "segmentation":
-                gt = parse_segmentation_masks(targets, height, width, num_classes).to(device)
-            elif task == "detection":
-                gt = parse_detection_heatmap(targets, height, width).to(device)
-            elif task == "instance":
-                print("Instance segmentation training is not supported in dense loss setting.")
-                continue
-            else:
-                raise ValueError("Unsupported task.")
+    def finalize_and_visualize(self):
+        if not self.layer_stats:
+            return
 
-            if outputs.shape[1] != gt.shape[1]:
-                raise ValueError(f"Mismatch: model output channels = {outputs.shape[1]}, target = {gt.shape[1]}")
+        self.save_layer_stats()
+        keys = sorted(k for k in self.layer_stats[0].keys() if k != 'step')
+        steps = [stat['step'] for stat in self.layer_stats]
+        tensor = np.zeros((len(steps), len(keys) // 3, 3))
+        layer_names = []
+        for i, k in enumerate(keys):
+            base = k.rsplit('/', 1)[0]
+            if base not in layer_names:
+                layer_names.append(base)
+        stat_map = {'mean': 0, 'std': 1, 'kurtosis': 2}
+        for i, entry in enumerate(self.layer_stats):
+            for k, v in entry.items():
+                if k == 'step': continue
+                base, stat = k.rsplit('/', 1)
+                tensor[i, layer_names.index(base), stat_map[stat]] = v
+        plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.args.logf)
+        plot_interactive_3d(tensor, layer_names, list(stat_map.keys()))
 
-            loss = criterion(outputs, gt)
-            print("this is calculated loss: ", loss)
-
-        if not torch.isfinite(loss):
-            print(f"⚠️ Skipping update due to non-finite loss at step {step}")
-            continue
-
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        running_loss += loss.item()
-        log_telemetry(model, loss.item(), step)
-        step += 1
-    return running_loss / len(dataloader), step
-
-def validate(model, dataloader, criterion, device, step_start, task, num_classes):
-    model.eval()
-    val_loss = 0.0
-    step = step_start
-    with torch.no_grad():
+    def train_one_epoch(self, model, dataloader, ce_criterion, dice_crition, optimizer, device, step_start, task, num_classes, scaler):
+        model.train()
+        running_loss = 0.0
+        step = step_start
         for images, targets in dataloader:
             images = images.to(device)
-            with autocast(dtype=torch.float16):
+            with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(images)
                 height, width = outputs.shape[2:]
 
@@ -146,6 +106,7 @@ def validate(model, dataloader, criterion, device, step_start, task, num_classes
                 elif task == "detection":
                     gt = parse_detection_heatmap(targets, height, width).to(device)
                 elif task == "instance":
+                    print("Instance segmentation training is not supported in dense loss setting.")
                     continue
                 else:
                     raise ValueError("Unsupported task.")
@@ -153,72 +114,107 @@ def validate(model, dataloader, criterion, device, step_start, task, num_classes
                 if outputs.shape[1] != gt.shape[1]:
                     raise ValueError(f"Mismatch: model output channels = {outputs.shape[1]}, target = {gt.shape[1]}")
 
-                loss = criterion(outputs, gt)
-                if not torch.isfinite(loss):
-                    print(f"⚠️ Skipping validation step due to non-finite loss at step {step}")
-                    continue
+                loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
 
-                val_loss += loss.item()
-                wandb.log({"val/loss": loss.item()}, step=step)
-                step += 1
-    return val_loss / len(dataloader), step
+            if not torch.isfinite(loss):
+                print(f"⚠️ Skipping update due to non-finite loss at step {step}")
+                continue
 
-# --- Main Function ---
-def main(args):
-    wandb.init(project="unet-fp16-coco", name = "trial: getting right logging", config=vars(args))
-    device = torch.device("cuda:1")
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
-    dataset = CocoDetection(root=args.coco_root,
-                            annFile=args.ann_file,
-                            transform=transform)
+            running_loss += loss.item()
+            if self.args.enable_logging:
+                self.log_telemetry(model, loss.item(), step)
+            step += 1
+        return running_loss / len(dataloader), step
 
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    def validate(self, model, dataloader, ce_criterion, dice_crition, device, step_start, task, num_classes):
+        model.eval()
+        val_loss = 0.0
+        step = step_start
+        with torch.no_grad():
+            for images, targets in dataloader:
+                images = images.to(device)
+                with autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(images)
+                    height, width = outputs.shape[2:]
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
-        print(f"Fold {fold + 1}/5")
-        train_subset = Subset(dataset, train_idx.tolist())
-        val_subset = Subset(dataset, val_idx.tolist())
+                    if task == "segmentation":
+                        gt = parse_segmentation_masks(targets, height, width, num_classes).to(device)
+                    elif task == "detection":
+                        gt = parse_detection_heatmap(targets, height, width).to(device)
+                    elif task == "instance":
+                        continue
+                    else:
+                        raise ValueError("Unsupported task.")
 
-        train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
-        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
+                    if outputs.shape[1] != gt.shape[1]:
+                        raise ValueError(f"Mismatch: model output channels = {outputs.shape[1]}, target = {gt.shape[1]}")
 
-        def get_max_category_id(dataset, sample_size=1000):
-            max_cat = 0
-            for i in range(min(len(dataset), sample_size)):
-                _, anns = dataset[i]
-                if anns:
-                    max_cat = max(max_cat, max(ann['category_id'] for ann in anns))
-            return max_cat + 1
+                    loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
+                    if not torch.isfinite(loss):
+                        print(f"⚠️ Skipping validation step due to non-finite loss at step {step}")
+                        continue
 
-        num_classes = get_max_category_id(dataset)
-        print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
+                    val_loss += loss.item()
+                    wandb.log({"val/loss": loss.item()}, step=step)
+                    step += 1
+        return val_loss / len(dataloader), step
 
-        model = UNetFP16(in_channels=3, out_channels=num_classes).to(device)
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        scaler = GradScaler()
+    def run(self):
+        if self.args.enable_logging: 
+            wandb.init(project="unet-fp16-coco", name = "smaller model, new loss", config=vars(self.args))
+        device = torch.device("cuda:1")
+        transform = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+        ])
 
-        step = 0
-        for epoch in range(args.epochs):
-            train_loss, step = train_one_epoch(model, train_loader, criterion, optimizer, device, step, args.task, num_classes, scaler)
-            val_loss, step = validate(model, val_loader, criterion, device, step, args.task, num_classes)
-            print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
-            wandb.log({"epoch": epoch + 1, "train/avg_loss": train_loss, "val/avg_loss": val_loss}, step=step)
+        dataset = CocoDetection(root=self.args.coco_root,
+                                annFile=self.args.ann_file,
+                                transform=transform)
 
-        torch.save(model.state_dict(), f"unet_fold{fold + 1}.pth")
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-# --- Argument Parsing ---
+        for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
+            print(f"Fold {fold + 1}/5")
+            train_subset = Subset(dataset, train_idx.tolist())
+            val_subset = Subset(dataset, val_idx.tolist())
+
+            train_loader = DataLoader(train_subset, batch_size=self.args.batch_size, shuffle=True, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
+            val_loader = DataLoader(val_subset, batch_size=self.args.batch_size, shuffle=False, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
+
+            num_classes = get_max_category_id(dataset) + 1
+            print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
+
+            model = UNetFP16(in_channels=3, out_channels=num_classes).to(device)
+            print("size of the model: ", count_parameters(model))
+            ce_criterion = nn.CrossEntropyLoss()
+            dice_crition = DiceLoss()
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr, weight_decay=1e-5)
+            scaler = GradScaler(device='cuda')
+
+            step = 0
+            for epoch in range(self.args.epochs):
+                train_loss, step = self.train_one_epoch(model, train_loader, ce_criterion, dice_crition, optimizer, device, step, self.args.task, num_classes, scaler)
+                val_loss, step = self.validate(model, val_loader, ce_criterion, dice_crition, device, step, self.args.task, num_classes)
+                print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
+                if self.args.enable_logging:
+                    wandb.log({"epoch": epoch + 1, "train/avg_loss": train_loss, "val/avg_loss": val_loss}, step=step)
+                if self.args.debug:
+                    break
+
+            torch.save(model.state_dict(), f"unet_fold{fold + 1}.pth")
+            if self.args.debug:
+                break
+
+        self.finalize_and_visualize()
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--coco_root', type=str, help='Path to COCO images folder', default="coco2017/images/train2017")
-    parser.add_argument('--ann_file', type=str, help='Path to COCO annotation file', default="coco2017/annotations/instances_train2017.json")
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--task', type=str, choices=['segmentation', 'instance', 'detection'], default='segmentation')
-    args = parser.parse_args()
-    main(args)
+    args = configs()
+    runner = reduced_precision_trainer(args)
+    runner.run()
