@@ -23,7 +23,7 @@ def log_2d_histogram(wandb, wandb_key, layer_indices, values, title, ylabel, epo
 
 
 def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
-    out_path = "plots/" + args.task + "_" + type + "_" + "_heatmap.png"
+    out_path = "plots/" + args.task + "_" + type + "_heatmap.png"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     steps = tensor.shape[0]
     fig, axs = plt.subplots(len(stat_names), 1, figsize=(15, 10 * len(stat_names)), squeeze=False)
@@ -34,7 +34,7 @@ def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
         ax.set_xticks(np.arange(steps))
         ax.set_yticks(np.arange(len(layer_names)))
         ax.set_yticklabels(layer_names)
-        plt.xlabel("Every "+str(args.freq)+" Steps")
+        plt.xlabel("Every "+str(args.logf)+" Steps")
         fig.colorbar(im, ax=ax)
     plt.savefig(out_path)
     plt.close()

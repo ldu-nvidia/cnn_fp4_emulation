@@ -10,14 +10,16 @@ import argparse
 import wandb
 import numpy as np
 from pycocotools import mask as coco_mask
-from torch.amp import autocast, GradScaler
+from pycocotools.coco import COCO
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 import scipy.stats
 import json
 from config import configs
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
-from models.baseline import UNetFP16  # <- make sure this supports out_channels
+from models.baseline import UNetFP16 
 from visualize import plot_grid_heatmaps, plot_interactive_3d
 from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, coco_collate_fn, count_parameters, get_max_category_id, combined_loss
 
@@ -58,8 +60,6 @@ class reduced_precision_trainer():
 
         for name, param in model.named_parameters():
             new_name = rename(name)
-            print(new_name)
-
             if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
                 w = param.detach().cpu().float().numpy().flatten()
                 if np.isfinite(w).all():
@@ -71,8 +71,8 @@ class reduced_precision_trainer():
                         stat_dict_w[new_name + "/kurtosis"] = 0.0  
                     wandb.log({new_name: wandb.Histogram(w)}, step=step)
 
-            if param.requires_grad and 'bias' not in new_name and 'grad' in new_name:
-                w = param.detach().cpu().float().numpy().flatten()
+            if param.requires_grad and param.grad is not None and 'bias' not in new_name and 'weight' in new_name:
+                w = param.grad.detach().cpu().float().numpy().flatten()
                 if np.isfinite(w).all():
                     stat_dict_grad[new_name + "/mean"] = np.mean(w)
                     stat_dict_grad[new_name + "/std"] = np.std(w)
@@ -92,7 +92,7 @@ class reduced_precision_trainer():
         for outpath, layer_stats in zip(output_paths, [self.layer_stats_w, self.layer_stats_grad]):
             with open("plots/" + outpath, "w") as f:
                 serializable_stats = [
-                    {k: float(v) if isinstance(v, (np.floating, np.float32, np.float64)) else v for k, v in entry.items()}
+                    {k: float(v) if hasattr(v, 'item') and hasattr(v, 'dtype') else v for k, v in entry.items()}
                     for entry in layer_stats
                 ]
                 json.dump(serializable_stats, f)
@@ -100,8 +100,7 @@ class reduced_precision_trainer():
         print("✅ Layer stats saved to plot folder")
 
     def finalize_and_visualize(self):
-        if not self.layer_stats:
-            return
+        assert len(self.layer_stats_w) != 0 and len(self.layer_stats_w) != 0, "weight or grad stats are empty"
         self.save_layer_stats()
         for layer_stats, type in zip([self.layer_stats_w, self.layer_stats_grad], ['weights', 'grads']):
             keys = sorted(k for k in layer_stats[0].keys() if k != 'step')
@@ -213,7 +212,7 @@ class reduced_precision_trainer():
                 preds = torch.argmax(outputs, dim=1).cpu()
                 height, width = preds.shape[1:]
 
-                gt_masks = parse_segmentation_masks(targets, height, width, num_classes).argmax(1).cpu()
+                gt_masks = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).argmax(1).cpu()
 
                 for i in range(min(len(images), num_samples - samples_logged)):
                     img_np = TF.to_pil_image(images[i].cpu())

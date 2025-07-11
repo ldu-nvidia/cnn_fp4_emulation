@@ -19,32 +19,36 @@ def rename(old_name):
         new_name = old_name
     return new_name
 
-# --- Mask/Target Parsing Utilities ---
 def parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx):
     batch_masks = []
+
     for anns in targets:
         mask = torch.zeros((num_classes, height, width), dtype=torch.float32)
+
         for ann in anns:
-            if 'segmentation' not in ann:
-                continue
+            if 'segmentation' in ann:
+                coco_cat_id = ann['category_id']
+                if coco_cat_id not in category_id_to_class_idx:
+                    continue
+                class_idx = category_id_to_class_idx[coco_cat_id]
 
-            coco_cat_id = ann['category_id']
-            if coco_cat_id not in category_id_to_class_idx:
-                continue
+                rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
+                decoded = coco_mask.decode(rle)  # may be [H, W, N]
 
-            class_idx = category_id_to_class_idx[coco_cat_id]
+                if decoded.ndim == 3:
+                    decoded = decoded.any(axis=2)  # merge all masks
+                m_tensor = torch.from_numpy(decoded.astype(np.float32))  # [H, W]
 
-            rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
-            m = coco_mask.decode(rle)  # shape: [height, width] or [height, width, N]
+                m_tensor = m_tensor.unsqueeze(0)  # [1, H, W] for resize
+                m_tensor = resize(m_tensor, size=[height, width], interpolation=InterpolationMode.NEAREST)
+                m_tensor = m_tensor.squeeze(0)  # [H, W]
 
-            if m.ndim == 3:
-                m = np.any(m, axis=2)  # collapse multiple masks
-
-            m_tensor = torch.tensor(m, dtype=torch.float32)
-            mask[class_idx] = torch.max(mask[class_idx], m_tensor)
+                mask[class_idx] = torch.max(mask[class_idx], m_tensor)
 
         batch_masks.append(mask)
-    return torch.stack(batch_masks)
+
+    return torch.stack(batch_masks)  # [B, C, H, W]
+
 
 
 def parse_instance_masks(targets, height, width):
