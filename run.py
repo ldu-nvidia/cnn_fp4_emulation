@@ -1,6 +1,7 @@
 # --- Imports ---
 import torch
 import torch.nn as nn
+import torch.optim
 from torch.utils.data import DataLoader, random_split, Subset
 from torchvision import transforms
 from torchvision.datasets import CocoDetection
@@ -16,6 +17,7 @@ from torch.amp.grad_scaler import GradScaler
 import scipy.stats
 import json
 from config import configs
+from dataclasses import asdict
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -43,13 +45,13 @@ class DiceLoss(nn.Module):
         return 1.0 - dice_score.mean()
 
 class reduced_precision_trainer():
-    def __init__(self, args):
+    def __init__(self, config):
         self.layer_stats_w = []
         self.layer_stats_grad = []
-        self.args = args
+        self.config = config
 
     def log_telemetry(self, model, loss_value, step):
-        if step % self.args.logf != 0:
+        if step % self.config.logf != 0:
             return
         
         stat_dict_w, stat_dict_grad, stat_dict_a = {}, {}, {}
@@ -117,8 +119,8 @@ class reduced_precision_trainer():
                     if k == 'step': continue
                     base, stat = k.rsplit('/', 1)
                     tensor[i, layer_names.index(base), stat_map[stat]] = v
-            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.args, type)
-            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.args, type)
+            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type)
+            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type)
 
     def train_one_epoch(self, model, dataloader, ce_criterion, dice_crition, optimizer, device, step_start, task, num_classes, scaler):
         model.train()
@@ -156,7 +158,7 @@ class reduced_precision_trainer():
             scaler.update()
 
             running_loss += loss.item()
-            if self.args.enable_logging:
+            if self.config.enable_logging:
                 self.log_telemetry(model, loss.item(), step)
             step += 1
             if step == 100:
@@ -197,7 +199,7 @@ class reduced_precision_trainer():
                     if step == step_start + 20:
                         break
         
-        if self.args.enable_logging and self.args.visualize_val:
+        if self.config.enable_logging and self.config.visualize_val:
             self.log_visual_predictions(model, dataloader, num_samples=4, device=device, num_classes=num_classes)
         return val_loss / len(dataloader), step
 
@@ -237,19 +239,19 @@ class reduced_precision_trainer():
                         return
 
     def run(self):
-        if self.args.enable_logging: 
-            wandb.init(project="unet-fp16-coco", name = "smaller model, new loss", config=vars(self.args))
+        if self.config.enable_logging: 
+            wandb.init(project="unet-fp16-coco", name = "smaller model, new loss", config=asdict(self.config))
         device = torch.device("cuda:1")
         transform = transforms.Compose([
             transforms.Resize((256, 256)),
             transforms.ToTensor(),
         ])
 
-        dataset = CocoDetection(root=self.args.coco_root,
-                                annFile=self.args.ann_file,
+        dataset = CocoDetection(root=self.config.coco_root,
+                                annFile=self.config.ann_file,
                                 transform=transform)
         
-        coco = COCO(args.ann_file)
+        coco = COCO(self.config.ann_file)
         category_ids = sorted(coco.getCatIds())  # just get all category IDs
         self.category_id_to_class_idx = {cat_id: idx for idx, cat_id in enumerate(category_ids)}
         num_classes = len(self.category_id_to_class_idx)
@@ -261,8 +263,8 @@ class reduced_precision_trainer():
             train_subset = Subset(dataset, train_idx.tolist())
             val_subset = Subset(dataset, val_idx.tolist())
 
-            train_loader = DataLoader(train_subset, batch_size=self.args.batch_size, shuffle=True, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
-            val_loader = DataLoader(val_subset, batch_size=self.args.batch_size, shuffle=False, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
+            train_loader = DataLoader(train_subset, batch_size=self.config.batch_size, shuffle=True, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
+            val_loader = DataLoader(val_subset, batch_size=self.config.batch_size, shuffle=False, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
 
             print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
 
@@ -270,26 +272,26 @@ class reduced_precision_trainer():
             print("size of the model: ", count_parameters(model))
             ce_criterion = nn.CrossEntropyLoss()
             dice_crition = DiceLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=self.args.lr, weight_decay=1e-5)
+            optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr, weight_decay=1e-5)
             scaler = GradScaler(device='cuda')
 
             step = 0
-            for epoch in range(self.args.epochs):
-                train_loss, step = self.train_one_epoch(model, train_loader, ce_criterion, dice_crition, optimizer, device, step, self.args.task, num_classes, scaler)
-                val_loss, step = self.validate(model, val_loader, ce_criterion, dice_crition, device, step, self.args.task, num_classes)
+            for epoch in range(self.config.epochs):
+                train_loss, step = self.train_one_epoch(model, train_loader, ce_criterion, dice_crition, optimizer, device, step, self.config.task, num_classes, scaler)
+                val_loss, step = self.validate(model, val_loader, ce_criterion, dice_crition, device, step, self.config.task, num_classes)
                 print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
-                if self.args.enable_logging:
+                if self.config.enable_logging:
                     wandb.log({"epoch": epoch + 1, "train/avg_loss": train_loss, "val/avg_loss": val_loss}, step=step)
-                if self.args.debug:
+                if self.config.debug:
                     break
 
             torch.save(model.state_dict(), f"unet_fold{fold + 1}.pth")
-            if self.args.debug:
+            if self.config.debug:
                 break
 
         self.finalize_and_visualize()
 
 if __name__ == '__main__':
-    args = configs()
-    runner = reduced_precision_trainer(args)
+    config = configs()
+    runner = reduced_precision_trainer(config)
     runner.run()

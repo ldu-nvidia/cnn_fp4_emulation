@@ -1,18 +1,90 @@
 import argparse
+from typing import Optional
+from dataclasses import dataclass
 
-def configs():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--coco_root', type=str, help='Path to COCO images folder', default="coco2017/images/train2017")
-    parser.add_argument('--ann_file', type=str, help='Path to COCO annotation file', default="coco2017/annotations/instances_train2017.json")
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--task', type=str, choices=['segmentation', 'instance', 'detection'], default='segmentation')
-    parser.add_argument('--logf', type=int, default=50)
-    parser.add_argument('--enable_logging', type=bool, default=True)
-    parser.add_argument('--log_weights', type=bool, default=True)
-    parser.add_argument('--log_grads', type=bool, default=False)
-    parser.add_argument("--visualize_val", type=bool, default=True)
-    parser.add_argument('--debug', type=bool, default=True, help="debug mode, terminate early to make sure everything works")
+@dataclass
+class TrainingConfig:
+    """Configuration class for training parameters."""
+    # Data parameters
+    coco_root: str = "coco2017/images/train2017"
+    ann_file: str = "coco2017/annotations/instances_train2017.json"
+    
+    # Training parameters
+    batch_size: int = 4
+    lr: float = 1e-4
+    epochs: int = 5
+    task: str = "segmentation"  # choices: segmentation, instance, detection
+    
+    # Logging parameters
+    logf: int = 50
+    enable_logging: bool = True
+    log_weights: bool = True
+    log_grads: bool = False
+    visualize_val: bool = True
+    
+    # Debug parameters
+    debug: bool = True
+    
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        if self.task not in ['segmentation', 'instance', 'detection']:
+            raise ValueError(f"Invalid task: {self.task}. Must be one of: segmentation, instance, detection")
+        
+        if self.batch_size <= 0:
+            raise ValueError(f"Batch size must be positive, got: {self.batch_size}")
+        
+        if self.lr <= 0:
+            raise ValueError(f"Learning rate must be positive, got: {self.lr}")
+
+def parse_args() -> TrainingConfig:
+    """Parse command line arguments and return a TrainingConfig object."""
+    parser = argparse.ArgumentParser(description="Training configuration for CNN FP4 emulation")
+    
+    # Data parameters
+    parser.add_argument('--coco_root', type=str, 
+                       help='Path to COCO images folder', 
+                       default=TrainingConfig.coco_root)
+    parser.add_argument('--ann_file', type=str, 
+                       help='Path to COCO annotation file', 
+                       default=TrainingConfig.ann_file)
+    
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=TrainingConfig.batch_size)
+    parser.add_argument('--lr', type=float, default=TrainingConfig.lr)
+    parser.add_argument('--epochs', type=int, default=TrainingConfig.epochs)
+    parser.add_argument('--task', type=str, 
+                       choices=['segmentation', 'instance', 'detection'], 
+                       default=TrainingConfig.task)
+    
+    # Logging parameters
+    parser.add_argument('--logf', type=int, default=TrainingConfig.logf)
+    parser.add_argument('--enable_logging', action='store_true', default=TrainingConfig.enable_logging)
+    parser.add_argument('--log_weights', action='store_true', default=TrainingConfig.log_weights)
+    parser.add_argument('--log_grads', action='store_true', default=TrainingConfig.log_grads)
+    parser.add_argument('--visualize_val', action='store_true', default=TrainingConfig.visualize_val)
+    
+    # Debug parameters
+    parser.add_argument('--debug', action='store_true', default=TrainingConfig.debug,
+                       help="debug mode, terminate early to make sure everything works")
+    
     args = parser.parse_args()
-    return args
+    
+    return TrainingConfig(
+        coco_root=args.coco_root,
+        ann_file=args.ann_file,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        epochs=args.epochs,
+        task=args.task,
+        logf=args.logf,
+        enable_logging=args.enable_logging,
+        log_weights=args.log_weights,
+        log_grads=args.log_grads,
+        visualize_val=args.visualize_val,
+        debug=args.debug
+    )
+
+# For backward compatibility
+def configs():
+    """Legacy function that returns parsed configuration."""
+    return parse_args()
