@@ -16,16 +16,17 @@ from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 import scipy.stats
 import json
+from data import CocoSegmentationDataset
 from config import configs
 from dataclasses import asdict
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 from models.baseline import UNetFP16 
 from visualize import plot_grid_heatmaps, plot_interactive_3d
 from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
     coco_collate_fn, count_parameters, get_max_category_id, combined_loss, visualize_instance_batch, \
-    get_max_instances_from_annotations, log_visual_predictions
+    get_max_instances_from_annotations, log_visual_predictions_to_file, check_mask, save_visual_predictions, \
+        get_coco, get_max_instances_from_annotations
 from loss import DiceLoss, instance_loss
 
 class reduced_precision_trainer():
@@ -86,7 +87,7 @@ class reduced_precision_trainer():
         print("✅ Layer stats saved to plot folder")
 
     def finalize_and_visualize(self):
-        print("finalizing and visualizing")
+        print("\n finalizing and visualizing \n")
         assert len(self.layer_stats_w) != 0 and len(self.layer_stats_w) != 0, "weight or grad stats are empty"
         self.save_layer_stats()
         for layer_stats, type in zip([self.layer_stats_w, self.layer_stats_grad], ['weights', 'grads']):
@@ -107,36 +108,57 @@ class reduced_precision_trainer():
             plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type)
             plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type)
             print("✅ Plots saved to plot folder")
+        print("\n task finished \n")
 
-    def train_one_epoch(self, model, dataloader, ce_criterion, dice_crition, optimizer, device, step_start, task, num_classes, scaler):
+    def train_one_epoch(
+            self, model, dataloader, ce_criterion, dice_crition,
+            optimizer, device, step_start, task, num_classes, scaler
+    ):
         model.train()
         running_loss = 0.0
         step = step_start
+        visualized = False                     # ← visualize only once
+
         for images, targets in dataloader:
             images = images.to(device)
+
+            # ─── Forward pass (AMP) ─────────────────────────────────────────────────
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(images)
-                height, width = outputs.shape[2:]
-                if task == "segmentation":
-                    gt = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).to(device)
+                h, w = outputs.shape[2:]
+
+                if task == "semantic":
+                    gt = parse_segmentation_masks(
+                        targets, h, w, num_classes, self.category_id_to_class_idx
+                    ).to(device)
                     loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
+                    assert (
+                        gt.shape[-2:] == outputs.shape[-2:]
+                        and gt.shape[1] == num_classes
+                    ), "GT tensor shape mismatch with outputs or num_classes for semantic task"
+
                 elif task == "detection":
-                    gt = parse_detection_heatmap(targets, height, width).to(device)
-                    loss = 0.0
+                    gt = parse_detection_heatmap(targets, h, w).to(device)
+                    loss = torch.zeros([], device=device)
+
+
                 elif task == "instance":
-                    batch_masks, _ = parse_instance_masks(targets, height, width, self.category_id_to_class_idx)
+                    batch_masks, _ = parse_instance_masks(
+                        targets, h, w, self.category_id_to_class_idx
+                    )
                     batch_masks = [m.to(device) for m in batch_masks]
                     loss = instance_loss(outputs, batch_masks)
+                    assert (all(m.shape[-2:] == outputs.shape[-2:] for m in batch_masks)), "GT tensor shape mismatch with outputs for instance task"
 
                 else:
-                    raise ValueError("Unsupported task.")
+                    raise ValueError("Unsupported task")
 
-            # Ensure loss is a Tensor before finite-check and later .item() call
+            # ─── Back-prop & optimiser step ───────────────────────────────────────
             if not isinstance(loss, torch.Tensor):
                 loss = torch.tensor(loss, device=device)
 
             if not torch.isfinite(loss):
-                print(f"⚠️ Skipping update due to non-finite loss at step {step}")
+                print(f"⚠️  skipping non-finite loss at step {step}")
                 continue
 
             optimizer.zero_grad()
@@ -145,13 +167,34 @@ class reduced_precision_trainer():
             scaler.step(optimizer)
             scaler.update()
 
+            # ─── One-off visual check after first step ────────────────────────────
+            if not visualized:
+                print("\n📸  Visual sanity-check after first training step\n")
+                preds = torch.argmax(outputs, dim=1).cpu()
+                os.makedirs("plots/start_of_training_check", exist_ok=True)
+                save_visual_predictions(
+                    images=images.cpu(),
+                    targets=targets,
+                    preds=preds,
+                    config=self.config,
+                    task=task,
+                    num_classes=num_classes,
+                    category_id_to_class_idx=self.category_id_to_class_idx,
+                    save_prefix="plots/start_of_training_check"
+                )
+                visualized = True                 # ← flip flag so we don’t repeat
+
+            # ─── Book-keeping ─────────────────────────────────────────────────────
             running_loss += loss.item()
             if self.config.enable_logging:
                 self.log_telemetry(model, loss.item(), step)
             step += 1
-            if step == 100:
+
+            if step == 100:                       # your early-break for debugging
                 break
+
         return running_loss / len(dataloader), step
+
 
     def validate(self, model, dataloader, ce_criterion, dice_crition, device, step_start, task, num_classes):
         model.eval()
@@ -164,7 +207,7 @@ class reduced_precision_trainer():
                     outputs = model(images)
                     height, width = outputs.shape[2:]
 
-                    if task == "segmentation":
+                    if task == "semantic":
                         gt = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).to(device)
                     elif task == "detection":
                         gt = parse_detection_heatmap(targets, height, width).to(device)
@@ -188,42 +231,43 @@ class reduced_precision_trainer():
                         break
         
         if self.config.enable_logging and self.config.visualize_val:
-            assert self.config.task in ["segmentation", "instance"], \
+            assert self.config.task in ["semantic", "instance"], \
                 f"Unsupported task type: {self.config.task}"
-            log_visual_predictions(
+            print("\n start validating data after validation step \n")
+            log_visual_predictions_to_file(
                 self.config,
                 model,
                 dataloader,
-                num_samples=4,
                 device=device,
                 num_classes=num_classes,
-                category_id_to_class_idx=self.category_id_to_class_idx,
-                wandb=wandb
+                category_id_to_class_idx=self.category_id_to_class_idx
             )
 
         # Ensure validate always returns a tuple (val_loss, step)
         return val_loss / max(len(dataloader), 1), step
 
-
     def run(self):
+        print("start initial mask check, before training")
+        check_mask(128)
+
         if self.config.enable_logging: 
             wandb.init(project="unet-fp16-coco", name = "smaller model, new loss", config=asdict(self.config))
         device = torch.device("cuda:1")
-        transform = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.ToTensor(),
-        ])
 
-        dataset = CocoDetection(root=self.config.coco_root,
-                                annFile=self.config.ann_file,
-                                transform=transform)
-                    
-        coco = COCO(self.config.ann_file)
-        category_ids = sorted(coco.getCatIds())  # just get all category IDs
-        self.category_id_to_class_idx = {cat_id: idx for idx, cat_id in enumerate(category_ids)}
+        # get category to class index mapping once as global variable
+        coco = get_coco(self.config.ann_file)               # loads once
+        category_ids = sorted(coco.getCatIds())
+        self.category_id_to_class_idx = {cat: i for i, cat in enumerate(category_ids)}
+
+        dataset = CocoSegmentationDataset(
+            img_root=self.config.coco_root,
+            ann_file=self.config.ann_file,
+            category_id_to_class_idx=self.category_id_to_class_idx,
+            target_size=(256, 256)
+        )
         
         # for semantic segmentation, we need to know the number of classes, and no num_instances
-        if self.config.task == "segmentation":
+        if self.config.task == "semantic":
             num_classes = len(self.category_id_to_class_idx)
             num_instances = -1
         
@@ -231,13 +275,12 @@ class reduced_precision_trainer():
         if self.config.task == "instance":
             num_instances = get_max_instances_from_annotations(self.config.ann_file)
             print(f"Max number of instances per image = {num_instances}")
+            num_classes = len(self.category_id_to_class_idx)  # ✅ safer, consistent
 
-            # Still compute num_classes from annotations for visualization
-            num_classes = get_max_category_id(self.config.ann_file) + 1
             
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        kf = KFold(n_splits=5, shuffle=True, random_state=40)
 
-        for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
+        for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(len(dataset)))):
             print(f"Fold {fold + 1}/5")
             train_subset = Subset(dataset, train_idx.tolist())
             val_subset = Subset(dataset, val_idx.tolist())

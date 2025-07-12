@@ -13,7 +13,7 @@ class TrainingConfig:
     batch_size: int = 4
     lr: float = 1e-4
     epochs: int = 5
-    task: str = "instance"  # choices: segmentation, instance, detection
+    task: str = "instance"  # choices: semantic, instance, detection
     
     # Logging parameters
     logf: int = 50
@@ -27,8 +27,8 @@ class TrainingConfig:
     
     def __post_init__(self):
         """Validate configuration after initialization."""
-        if self.task not in ['segmentation', 'instance', 'detection']:
-            raise ValueError(f"Invalid task: {self.task}. Must be one of: segmentation, instance, detection")
+        if self.task not in ['semantic', 'instance', 'detection']:
+            raise ValueError(f"Invalid task: {self.task}. Must be one of: semantic, instance, detection")
         
         if self.batch_size <= 0:
             raise ValueError(f"Batch size must be positive, got: {self.batch_size}")
@@ -53,7 +53,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument('--lr', type=float, default=TrainingConfig.lr)
     parser.add_argument('--epochs', type=int, default=TrainingConfig.epochs)
     parser.add_argument('--task', type=str, 
-                       choices=['segmentation', 'instance', 'detection'], 
+                       choices=['semantic', 'instance', 'detection'], 
                        default=TrainingConfig.task)
     
     # Logging parameters
@@ -62,6 +62,7 @@ def parse_args() -> TrainingConfig:
     parser.add_argument('--log_weights', action='store_true', default=TrainingConfig.log_weights)
     parser.add_argument('--log_grads', action='store_true', default=TrainingConfig.log_grads)
     parser.add_argument('--visualize_val', action='store_true', default=TrainingConfig.visualize_val)
+
     
     # Debug parameters
     parser.add_argument('--debug', action='store_true', default=TrainingConfig.debug,

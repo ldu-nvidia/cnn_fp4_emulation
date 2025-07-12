@@ -51,8 +51,8 @@ class UNetFP16(nn.Module):
         self.upconv1 = nn.ConvTranspose2d(int(self.scale*128), int(self.scale*64), kernel_size=2, stride=2)
         self.dec1 = ConvBlock(int(self.scale*128), int(self.scale*64))
 
-        if task == "segmentation":
-            assert out_channels != -1, "out_channels must be specified for segmentation task"
+        if task == "semantic":
+            assert out_channels != -1, "out_channels must be specified for semantic task"
             self.out_conv = nn.Conv2d(int(self.scale*64), out_channels, kernel_size=1)
         elif task == "instance":
             assert num_instances != -1, "num_instances must be specified for instance task"

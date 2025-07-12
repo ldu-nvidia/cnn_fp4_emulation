@@ -1,17 +1,25 @@
 import torch
 import numpy as np
 from pycocotools import mask as coco_mask
-from torchvision.transforms.functional import resize, InterpolationMode
+from torchvision.transforms.functional import resize, InterpolationMode, to_pil_image
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as TF
 from pycocotools.coco import COCO
+import os
+from PIL import Image
+import matplotlib.cm as cm
+
+
 
 # note relu layer has no weight or bias
 block_to_layer_dict = {'0': "conv2d_1st",
                        '1': 'groupNorm_1st',
                        '3': 'conv2d_2nd',
                        '4': 'groupNorm_2nd'}
+
+# marco related to the coco dataset
+_COCO_CACHE = {}
 
 def denormalize_image(img_tensor):
     img_np = img_tensor.cpu().permute(1, 2, 0).numpy()
@@ -84,35 +92,34 @@ def parse_segmentation_masks(targets, height, width, num_classes, category_id_to
         batch_masks.append(mask)
     return torch.stack(batch_masks)
 
-def parse_instance_masks(targets, height, width, category_id_to_class_idx=None):
-    batch_masks = []
-    batch_classes = []
+def parse_instance_masks(targets, target_h, target_w, category_id_to_class_idx=None):
+    batch_masks, batch_classes = [], []
+
     for anns in targets:
-        masks = []
-        classes = []
+        inst_masks, inst_classes = [], []
         for ann in anns:
-            if 'segmentation' in ann and ann['segmentation']:
-                if category_id_to_class_idx is not None:
-                    coco_cat_id = ann['category_id']
-                    if coco_cat_id not in category_id_to_class_idx:
-                        continue
-                    class_idx = category_id_to_class_idx[coco_cat_id]
-                else:
-                    class_idx = ann['category_id']
-                rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
-                decoded = coco_mask.decode(rle)
-                if decoded.ndim == 3:
-                    decoded = np.any(decoded, axis=2)
-                mask_tensor = torch.from_numpy(decoded.astype(np.float32))
-                mask_tensor = TF.resize(mask_tensor.unsqueeze(0), size=[height, width], interpolation=InterpolationMode.NEAREST)
-                masks.append(mask_tensor.squeeze(0))
-                classes.append(class_idx)
-        if masks:
-            masks_tensor = torch.stack(masks)
-        else:
-            masks_tensor = torch.zeros((0, height, width), dtype=torch.float32)
-        batch_masks.append(masks_tensor)
-        batch_classes.append(classes)
+            if not ann.get("segmentation"):          # skip empty seg
+                continue
+
+            H0, W0 = ann["orig_height"], ann["orig_width"]
+            rle = coco_mask.frPyObjects(ann["segmentation"], H0, W0)
+            decoded = coco_mask.decode(rle)
+            if decoded.ndim == 3:                    # merge parts
+                decoded = np.any(decoded, axis=2)
+
+            m = torch.from_numpy(decoded.astype(np.float32))
+            m = TF.resize(m.unsqueeze(0), size=[target_h, target_w],
+                          interpolation=InterpolationMode.NEAREST).squeeze(0)
+            inst_masks.append(m)
+
+            cat_id = ann["category_id"]
+            cls = category_id_to_class_idx[cat_id] if category_id_to_class_idx else cat_id
+            inst_classes.append(cls)
+
+        batch_masks.append(torch.stack(inst_masks) if inst_masks
+                           else torch.zeros((0, target_h, target_w)))
+        batch_classes.append(inst_classes)
+
     return batch_masks, batch_classes
 
 def parse_detection_heatmap(targets, height, width, num_classes=80):
@@ -134,17 +141,13 @@ def coco_collate_fn(batch):
     images = torch.stack(images, dim=0)
     return images, list(targets)
 
+
 def count_parameters(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total:,}")
     print(f"Trainable parameters: {trainable:,}")
     return total, trainable
-
-def get_max_category_id(ann_file):
-    coco = COCO(ann_file)
-    cat_ids = coco.getCatIds()
-    return max(cat_ids)
 
 def combined_loss(logits, targets, ce_criterion, dice_criterion):
     assert targets.ndim == 4, f"Expected targets [B, C, H, W], got {targets.shape}"
@@ -153,59 +156,174 @@ def combined_loss(logits, targets, ce_criterion, dice_criterion):
     dice_loss = dice_criterion(logits, targets)
     return 0.7 * ce_loss + 0.3 * dice_loss
 
-def get_max_instances_from_annotations(ann_file):
-    coco = COCO(ann_file)
-    max_instances = max(len(anns) for anns in coco.imgToAnns.values())
-    return max_instances
+def save_visual_predictions(images, targets, preds, config, task, num_classes, category_id_to_class_idx, save_prefix="train_step"):
+    height, width = preds.shape[1:]
+    B = images.size(0)
 
-def log_visual_predictions(config, model, dataloader, num_samples, device, num_classes, category_id_to_class_idx, wandb):
+    if task == "instance":
+        for i in range(min(2, B)):
+            img_np = denormalize_image(images[i])
+            pred_mask = preds[i].numpy()
+            inst_masks, class_ids = parse_instance_masks([targets[i]], height, width, category_id_to_class_idx)
+            fig = visualize_instance_batch(img_np, pred_mask, inst_masks[0], class_ids[0], num_classes)
+            fig.savefig(f"{save_prefix}_instance_{i}.png")
+            plt.close(fig)
+    else:  # semantic
+        gt_masks = parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx).argmax(1).cpu()
+        for i in range(min(2, B)):
+            img_np = TF.to_pil_image(images[i].cpu())
+            pred_mask = preds[i].numpy()
+            gt_mask = gt_masks[i].numpy()
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            axes[0].imshow(img_np)
+            axes[0].set_title("Input Image")
+            axes[1].imshow(pred_mask, alpha=0.5, cmap='jet')
+            axes[1].set_title("Prediction")
+            axes[2].imshow(gt_mask, alpha=0.5, cmap='jet')
+            axes[2].set_title("Ground Truth")
+            for ax in axes: ax.axis("off")
+            fig.tight_layout()
+            fig.savefig(f"{save_prefix}_semantic_{i}.png")
+            plt.close(fig)
+
+
+def log_visual_predictions_to_file(
+    config,
+    model,
+    dataloader,
+    device,
+    num_classes,
+    category_id_to_class_idx,
+):
+    output_dir="plots/final_check/"
+    os.makedirs(output_dir, exist_ok=True)
     model.eval()
     assert num_classes > 0, "num_classes must be a positive integer"
     class_colors = plt.cm.get_cmap("tab20", num_classes)
-    samples_logged = 0
-    with torch.no_grad():
-        for images, targets in dataloader:
-            assert isinstance(images, torch.Tensor)
-            assert isinstance(targets, list)
-            images = images.to(device)
-            outputs = model(images)
-            assert outputs.ndim == 4
-            preds = torch.argmax(outputs, dim=1).cpu()
-            height, width = preds.shape[1:]
-            B = images.size(0)
-            assert preds.shape[0] == B
 
-            if config.task == "instance":
-                for i in range(min(B, num_samples - samples_logged)):
-                    img_np = denormalize_image(images[i])
-                    pred_mask = preds[i].numpy()
-                    inst_masks, class_ids = parse_instance_masks([targets[i]], height, width, category_id_to_class_idx)
-                    fig = visualize_instance_batch(img_np, pred_mask, inst_masks[0], class_ids[0], num_classes)
-                    wandb.log({f"vis/instance_sample_{samples_logged}": wandb.Image(fig)})
-                    plt.close(fig)
-                    samples_logged += 1
-                    if samples_logged >= num_samples:
-                        return
-            else:
-                gt_masks = parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx)
-                gt_masks = gt_masks.argmax(1).cpu()
-                for i in range(min(B, num_samples - samples_logged)):
-                    img_np = TF.to_pil_image(images[i].cpu())
-                    pred_mask = preds[i].numpy()
-                    gt_mask = gt_masks[i].numpy()
-                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-                    axes[0].imshow(img_np)
-                    axes[0].set_title("Input Image")
-                    axes[1].imshow(img_np)
-                    axes[1].imshow(pred_mask, alpha=0.5, cmap='jet')
-                    axes[1].set_title("Predicted Mask")
-                    axes[2].imshow(img_np)
-                    axes[2].imshow(gt_mask, alpha=0.5, cmap='jet')
-                    axes[2].set_title("Ground Truth Mask")
-                    for ax in axes: ax.axis("off")
-                    fig.tight_layout()
-                    wandb.log({f"vis/sample_{samples_logged}": wandb.Image(fig)})
-                    plt.close(fig)
-                    samples_logged += 1
-                    if samples_logged >= num_samples:
-                        return
+    # Use only the last batch from the dataloader
+    images, targets = list(dataloader)[-1]
+    assert isinstance(images, torch.Tensor)
+    assert isinstance(targets, list)
+
+    images = images.to(device)
+    with torch.no_grad():
+        outputs = model(images)
+
+    preds = torch.argmax(outputs, dim=1).cpu()
+    height, width = preds.shape[1:]
+    B = images.size(0)
+
+    if config.task == "instance":
+        for i in range(B):
+            img_np = denormalize_image(images[i])
+            pred_mask = preds[i].numpy()
+            inst_masks, class_ids = parse_instance_masks([targets[i]], height, width, category_id_to_class_idx)
+            fig = visualize_instance_batch(img_np, pred_mask, inst_masks[0], class_ids[0], num_classes)
+            out_path = os.path.join(output_dir, f"instance_final_check_{i}.png")
+            fig.savefig(out_path)
+            print(f"Saved: {out_path}")
+            plt.close(fig)
+
+    else:  # semantic segmentation
+        gt_masks = parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx)
+        gt_masks = gt_masks.argmax(1).cpu()
+        for i in range(B):
+            img_np = to_pil_image(images[i].cpu())
+            pred_mask = preds[i].numpy()
+            gt_mask = gt_masks[i].numpy()
+
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            axes[0].imshow(img_np)
+            axes[0].set_title("Input Image")
+            axes[1].imshow(img_np)
+            axes[1].imshow(pred_mask, alpha=0.5, cmap='jet')
+            axes[1].set_title("Predicted Mask")
+            axes[2].imshow(img_np)
+            axes[2].imshow(gt_mask, alpha=0.5, cmap='jet')
+            axes[2].set_title("Ground Truth Mask")
+            for ax in axes:
+                ax.axis("off")
+            fig.tight_layout()
+
+            out_path = os.path.join(output_dir, f"semantic_finanl_check_{i}.png")
+            fig.savefig(out_path)
+            print(f"Saved: {out_path}")
+            plt.close(fig)
+
+
+def check_mask(img_id):
+    # --- Configuration ---
+    img_root = "coco2017/images/train2017"
+    ann_file = "coco2017/annotations/instances_train2017.json"
+    output_sem_path = "semantic_mask_check.png"
+    output_inst_path = "instance_mask_check.png"
+
+    # --- Load COCO annotations ---
+    coco = COCO(ann_file)
+    img_ids = coco.getImgIds()
+    img_id = img_ids[img_id]  # just pick the first image for demo
+    img_info = coco.loadImgs(img_id)[0]
+
+    # --- Load image ---
+    img_path = os.path.join(img_root, img_info['file_name'])
+    image = Image.open(img_path).convert("RGB")
+    width, height = image.size
+    image_np = np.array(image)
+
+    # --- Load annotations ---
+    ann_ids = coco.getAnnIds(imgIds=img_id)
+    anns = coco.loadAnns(ann_ids)
+
+    # --- Semantic mask ---
+    sem_mask = np.zeros((height, width), dtype=np.uint8)
+    # --- Instance mask (color-coded by instance id) ---
+    inst_mask = np.zeros((height, width), dtype=np.int32)
+
+    for idx, ann in enumerate(anns):
+        cat_id = ann["category_id"]
+        inst_id = ann["id"]
+        if ann.get("iscrowd", 0):
+            rle = ann["segmentation"]
+        else:
+            rle = coco_mask.frPyObjects(ann["segmentation"], height, width)
+
+        binary_mask = coco_mask.decode(rle)
+        if binary_mask.ndim == 3:
+            binary_mask = np.any(binary_mask, axis=2)
+
+        sem_mask[binary_mask > 0] = cat_id
+        inst_mask[binary_mask > 0] = inst_id  # unique per instance
+
+    os.makedirs("plots/initial_check", exist_ok=True)
+    # --- Save semantic segmentation visualization ---
+    norm_sem_mask = sem_mask.astype(float)
+    norm_sem_mask /= max(1, norm_sem_mask.max())  # normalize to [0,1]
+    sem_color = (cm.nipy_spectral(norm_sem_mask)[:, :, :3] * 255).astype(np.uint8)
+    sem_image = Image.fromarray(sem_color)
+    sem_image.save("plots/initial_check/"+output_sem_path)
+
+    # --- Save instance segmentation visualization ---
+    rand_colors = np.random.randint(0, 255, (inst_mask.max() + 1, 3), dtype=np.uint8)
+    inst_rgb = rand_colors[inst_mask]
+    overlay = (0.2 * image_np + 0.8 * inst_rgb).astype(np.uint8)
+    inst_image = Image.fromarray(overlay)
+    inst_image.save("plots/initial_check/"+output_inst_path)
+
+    print(f"✅ Saved initial semantic mask to {output_sem_path}")
+    print(f"✅ Saved initial instance overlay to {output_inst_path}\n\n")
+
+
+
+def get_coco(ann_file):
+    if ann_file not in _COCO_CACHE:
+        _COCO_CACHE[ann_file] = COCO(ann_file)
+    return _COCO_CACHE[ann_file]
+
+def get_max_instances_from_annotations(ann_file):
+    coco = get_coco(ann_file)
+    return max(len(anns) for anns in coco.imgToAnns.values())
+
+def get_max_category_id(ann_file):
+    coco = get_coco(ann_file)
+    return max(coco.getCatIds())
