@@ -20,7 +20,7 @@ class ConvBlock(nn.Module):
 
 # UNet model with GroupNorm and AMP-safe layers
 class UNetFP16(nn.Module):
-    def __init__(self, in_channels=3, out_channels=80):
+    def __init__(self, task, in_channels=3, out_channels=80, num_instances=10):
         super().__init__()
         self.scale = 0.25
 
@@ -51,7 +51,14 @@ class UNetFP16(nn.Module):
         self.upconv1 = nn.ConvTranspose2d(int(self.scale*128), int(self.scale*64), kernel_size=2, stride=2)
         self.dec1 = ConvBlock(int(self.scale*128), int(self.scale*64))
 
-        self.out_conv = nn.Conv2d(int(self.scale*64), out_channels, kernel_size=1)
+        if task == "segmentation":
+            assert out_channels != -1, "out_channels must be specified for segmentation task"
+            self.out_conv = nn.Conv2d(int(self.scale*64), out_channels, kernel_size=1)
+        elif task == "instance":
+            assert num_instances != -1, "num_instances must be specified for instance task"
+            self.out_conv = nn.Conv2d(int(self.scale*64), num_instances, kernel_size=1)
+        else:
+            raise ValueError("Unsupported task type")
 
     def forward(self, x):
         # Do NOT cast to FP16 manually — use autocast externally during training

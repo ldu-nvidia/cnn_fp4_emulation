@@ -2,3 +2,6 @@
 __pycache__/
 **.pth
 coco2017/
+plots/
+**.png
+**.jpg

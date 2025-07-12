@@ -23,26 +23,10 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from models.baseline import UNetFP16 
 from visualize import plot_grid_heatmaps, plot_interactive_3d
-from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, coco_collate_fn, count_parameters, get_max_category_id, combined_loss
-
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super().__init__()
-        self.smooth = smooth
-
-    def forward(self, logits, targets):
-        assert logits.ndim == 4, f"logits must be 4D, got {logits.shape}"
-        assert targets.ndim == 4, f"targets must be 4D (one-hot), got {targets.shape}"
-        assert logits.shape == targets.shape, f"Shape mismatch: logits {logits.shape}, targets {targets.shape}"
-
-        probs = F.softmax(logits, dim=1)
-        targets = targets.float()
-
-        intersection = torch.sum(probs * targets, dim=(2, 3))
-        union = torch.sum(probs + targets, dim=(2, 3))
-
-        dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
-        return 1.0 - dice_score.mean()
+from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
+    coco_collate_fn, count_parameters, get_max_category_id, combined_loss, visualize_instance_batch, \
+    get_max_instances_from_annotations, log_visual_predictions
+from loss import DiceLoss, instance_loss
 
 class reduced_precision_trainer():
     def __init__(self, config):
@@ -102,6 +86,7 @@ class reduced_precision_trainer():
         print("✅ Layer stats saved to plot folder")
 
     def finalize_and_visualize(self):
+        print("finalizing and visualizing")
         assert len(self.layer_stats_w) != 0 and len(self.layer_stats_w) != 0, "weight or grad stats are empty"
         self.save_layer_stats()
         for layer_stats, type in zip([self.layer_stats_w, self.layer_stats_grad], ['weights', 'grads']):
@@ -121,6 +106,7 @@ class reduced_precision_trainer():
                     tensor[i, layer_names.index(base), stat_map[stat]] = v
             plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type)
             plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type)
+            print("✅ Plots saved to plot folder")
 
     def train_one_epoch(self, model, dataloader, ce_criterion, dice_crition, optimizer, device, step_start, task, num_classes, scaler):
         model.train()
@@ -131,21 +117,23 @@ class reduced_precision_trainer():
             with autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(images)
                 height, width = outputs.shape[2:]
-
                 if task == "segmentation":
                     gt = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).to(device)
+                    loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
                 elif task == "detection":
                     gt = parse_detection_heatmap(targets, height, width).to(device)
+                    loss = 0.0
                 elif task == "instance":
-                    print("Instance segmentation training is not supported in dense loss setting.")
-                    continue
+                    batch_masks, _ = parse_instance_masks(targets, height, width, self.category_id_to_class_idx)
+                    batch_masks = [m.to(device) for m in batch_masks]
+                    loss = instance_loss(outputs, batch_masks)
+
                 else:
                     raise ValueError("Unsupported task.")
 
-                if outputs.shape[1] != gt.shape[1]:
-                    raise ValueError(f"Mismatch: model output channels = {outputs.shape[1]}, target = {gt.shape[1]}")
-
-                loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
+            # Ensure loss is a Tensor before finite-check and later .item() call
+            if not isinstance(loss, torch.Tensor):
+                loss = torch.tensor(loss, device=device)
 
             if not torch.isfinite(loss):
                 print(f"⚠️ Skipping update due to non-finite loss at step {step}")
@@ -200,43 +188,22 @@ class reduced_precision_trainer():
                         break
         
         if self.config.enable_logging and self.config.visualize_val:
-            self.log_visual_predictions(model, dataloader, num_samples=4, device=device, num_classes=num_classes)
-        return val_loss / len(dataloader), step
+            assert self.config.task in ["segmentation", "instance"], \
+                f"Unsupported task type: {self.config.task}"
+            log_visual_predictions(
+                self.config,
+                model,
+                dataloader,
+                num_samples=4,
+                device=device,
+                num_classes=num_classes,
+                category_id_to_class_idx=self.category_id_to_class_idx,
+                wandb=wandb
+            )
 
-    def log_visual_predictions(self, model, dataloader, num_samples, device, num_classes):
-        model.eval()
-        class_colors = plt.cm.get_cmap("tab20", num_classes)
-        samples_logged = 0
-        with torch.no_grad():
-            for images, targets in dataloader:
-                images = images.to(device)
-                outputs = model(images)
-                preds = torch.argmax(outputs, dim=1).cpu()
-                height, width = preds.shape[1:]
+        # Ensure validate always returns a tuple (val_loss, step)
+        return val_loss / max(len(dataloader), 1), step
 
-                gt_masks = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).argmax(1).cpu()
-
-                for i in range(min(len(images), num_samples - samples_logged)):
-                    img_np = TF.to_pil_image(images[i].cpu())
-                    pred_mask = preds[i].numpy()
-                    gt_mask = gt_masks[i].numpy()
-
-                    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-                    axes[0].imshow(img_np)
-                    axes[0].set_title("Input Image")
-                    axes[1].imshow(img_np)
-                    axes[1].imshow(pred_mask, alpha=0.5, cmap='jet')
-                    axes[1].set_title("Predicted Mask")
-                    axes[2].imshow(img_np)
-                    axes[2].imshow(gt_mask, alpha=0.5, cmap='jet')
-                    axes[2].set_title("Ground Truth Mask")
-                    for ax in axes: ax.axis("off")
-                    fig.tight_layout()
-                    wandb.log({f"vis/sample_{samples_logged}": wandb.Image(fig)})
-                    plt.close(fig)
-                    samples_logged += 1
-                    if samples_logged >= num_samples:
-                        return
 
     def run(self):
         if self.config.enable_logging: 
@@ -250,12 +217,24 @@ class reduced_precision_trainer():
         dataset = CocoDetection(root=self.config.coco_root,
                                 annFile=self.config.ann_file,
                                 transform=transform)
-        
+                    
         coco = COCO(self.config.ann_file)
         category_ids = sorted(coco.getCatIds())  # just get all category IDs
         self.category_id_to_class_idx = {cat_id: idx for idx, cat_id in enumerate(category_ids)}
-        num_classes = len(self.category_id_to_class_idx)
+        
+        # for semantic segmentation, we need to know the number of classes, and no num_instances
+        if self.config.task == "segmentation":
+            num_classes = len(self.category_id_to_class_idx)
+            num_instances = -1
+        
+        # for instance segmentation, we need to know the number of instances, and no num_classes
+        if self.config.task == "instance":
+            num_instances = get_max_instances_from_annotations(self.config.ann_file)
+            print(f"Max number of instances per image = {num_instances}")
 
+            # Still compute num_classes from annotations for visualization
+            num_classes = get_max_category_id(self.config.ann_file) + 1
+            
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
@@ -268,7 +247,7 @@ class reduced_precision_trainer():
 
             print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
 
-            model = UNetFP16(in_channels=3, out_channels=num_classes).to(device)
+            model = UNetFP16(task=self.config.task, in_channels=3, out_channels=num_classes, num_instances=num_instances).to(device)
             print("size of the model: ", count_parameters(model))
             ce_criterion = nn.CrossEntropyLoss()
             dice_crition = DiceLoss()
@@ -277,7 +256,9 @@ class reduced_precision_trainer():
 
             step = 0
             for epoch in range(self.config.epochs):
+                print("training, epoch: ", epoch)
                 train_loss, step = self.train_one_epoch(model, train_loader, ce_criterion, dice_crition, optimizer, device, step, self.config.task, num_classes, scaler)
+                print("validating, epoch: ", epoch)
                 val_loss, step = self.validate(model, val_loader, ce_criterion, dice_crition, device, step, self.config.task, num_classes)
                 print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
                 if self.config.enable_logging:
@@ -290,8 +271,3 @@ class reduced_precision_trainer():
                 break
 
         self.finalize_and_visualize()
-
-if __name__ == '__main__':
-    config = configs()
-    runner = reduced_precision_trainer(config)
-    runner.run()

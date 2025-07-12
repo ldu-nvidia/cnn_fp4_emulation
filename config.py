@@ -13,7 +13,7 @@ class TrainingConfig:
     batch_size: int = 4
     lr: float = 1e-4
     epochs: int = 5
-    task: str = "segmentation"  # choices: segmentation, instance, detection
+    task: str = "instance"  # choices: segmentation, instance, detection
     
     # Logging parameters
     logf: int = 50

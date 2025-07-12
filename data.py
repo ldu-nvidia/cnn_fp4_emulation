@@ -3,7 +3,30 @@ import subprocess
 from torchvision.datasets import CocoDetection
 import torchvision.transforms as T
 from torch.utils.data import DataLoader, random_split
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from torchvision.datasets import CocoDetection
+from torchvision import transforms
+from pycocotools import mask as coco_mask
+from PIL import Image
 
+class CocoSegmentationDataset(Dataset):
+    def __init__(self, img_root, ann_file, transform_img = None, transform_mask = None):
+        self.base = CocoDetection(root = img_root, annFile = ann_file)
+        self.transform_img = transform_img
+        self.transform_mask = transform_mask
+
+    def __len__(self):
+        return len(self.base)
+    
+    def __getitem__(self, idx):
+        image, annotations = self.base[idx]
+        # get image size
+        width, height = image.val_size
+        mask = np.zeros((height, width), dtype = np.uint8)
+        # convert coco segmentation polygons to binary mask
 
 def prepare_data():
     # Where to store the COCO data locally
