@@ -9,7 +9,7 @@ from pycocotools.coco import COCO
 import os
 from PIL import Image
 import matplotlib.cm as cm
-
+import plotly.graph_objects as go
 
 
 # note relu layer has no weight or bias
@@ -166,7 +166,7 @@ def save_visual_predictions(images, targets, preds, config, task, num_classes, c
             pred_mask = preds[i].numpy()
             inst_masks, class_ids = parse_instance_masks([targets[i]], height, width, category_id_to_class_idx)
             fig = visualize_instance_batch(img_np, pred_mask, inst_masks[0], class_ids[0], num_classes)
-            fig.savefig(f"{save_prefix}_instance_{i}.png")
+            fig.savefig(f"{save_prefix}instance_{i}.png")
             plt.close(fig)
     else:  # semantic
         gt_masks = parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx).argmax(1).cpu()
@@ -327,3 +327,41 @@ def get_max_instances_from_annotations(ann_file):
 def get_max_category_id(ann_file):
     coco = get_coco(ann_file)
     return max(coco.getCatIds())
+
+
+def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
+    os.makedirs("plots/heatmaps/", exist_ok=True)
+    out_path = "plots/heatmaps/" + args.task + "_" + type + ".png"
+    steps = tensor.shape[0]
+    fig, axs = plt.subplots(len(stat_names), 1, figsize=(15, 10 * len(stat_names)), squeeze=False)
+    # Add a dedicated title on every subplot (mean, std, kurtosis)
+    singular_type = type[:-1] if type.endswith('s') else type  # e.g., weights ➜ weight
+    for i, stat in enumerate(stat_names):
+        ax = axs[i, 0]
+        ax.set_title(f"{singular_type.capitalize()} Stats: {stat}", fontsize=30)
+        im = ax.imshow(tensor[:, :, i].T, aspect='auto', cmap='viridis', origin='lower')
+        ax.set_xticks(list(range(steps)))
+        ax.set_yticks(list(range(len(layer_names))))
+        layer_names = [name.replace("weight", "") if "weight" in name else name for name in layer_names]
+        ax.set_yticklabels(layer_names)
+        plt.xlabel("Every "+ str(args.logf) +" Steps")
+        fig.colorbar(im, ax=ax)
+    plt.savefig(out_path)
+    plt.close()
+
+def plot_interactive_3d(tensor, layer_names, stat_names, args, type):
+    os.makedirs("plots/heatmaps/", exist_ok=True)
+    out_path="plots/heatmaps/" + args.task + "_" + type + ".html"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    steps, layers, stats = tensor.shape
+    fig = go.Figure()
+    for i in range(stats):
+        z = tensor[:, :, i].T
+        fig.add_trace(go.Surface(z=z, name=stat_names[i]))
+    fig.update_layout(title="Layer Stats 3D", scene=dict(
+        xaxis_title="Step",
+        yaxis_title="Layer",
+        zaxis_title="Stat Value",
+        yaxis=dict(tickmode='array', tickvals=list(range(len(layer_names))), ticktext=layer_names)
+    ))
+    fig.write_html(out_path)

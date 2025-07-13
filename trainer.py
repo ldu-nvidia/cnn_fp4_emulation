@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, random_split, Subset
 from torchvision import transforms
 from torchvision.datasets import CocoDetection
 from sklearn.model_selection import KFold
-import os
+import os, random
 import argparse
 import wandb
 import numpy as np
@@ -22,12 +22,31 @@ from dataclasses import asdict
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from models.baseline import UNetFP16 
-from visualize import plot_grid_heatmaps, plot_interactive_3d
 from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
     coco_collate_fn, count_parameters, get_max_category_id, combined_loss, visualize_instance_batch, \
     get_max_instances_from_annotations, log_visual_predictions_to_file, check_mask, save_visual_predictions, \
-        get_coco, get_max_instances_from_annotations
+        get_coco, get_max_instances_from_annotations, plot_grid_heatmaps, plot_interactive_3d
 from loss import DiceLoss, instance_loss
+
+SEED = 8        # pick any integer you like ────────────────┐
+torch.manual_seed(SEED)       # <- torch CPU ops                │
+random.seed(SEED)             # <- python.random                │
+np.random.seed(SEED)          # <- NumPy                        │
+torch.cuda.manual_seed(SEED)  # <- torch GPU ops (optional)     │
+torch.backends.cudnn.deterministic = True   # reproducible conv │
+torch.backends.cudnn.benchmark = False      # (may slow a bit)  │
+# ───────────────────────────────────────────────────────────────┘
+
+# 1.  torch.Generator to control the *shuffling* RNG
+g = torch.Generator()
+g.manual_seed(SEED)
+
+# 2. worker_init_fn so *each* worker gets a deterministic, unique seed
+def seed_worker(worker_id: int):
+    # base_seed is the same for every worker but worker_id makes it unique
+    worker_seed = SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 class reduced_precision_trainer():
     def __init__(self, config):
@@ -75,15 +94,16 @@ class reduced_precision_trainer():
 
     def save_layer_stats(self):
         output_paths=["weights_layer_stats.json", "grads_layer_stats.json"]
-        os.makedirs("plots", exist_ok=True)
+        directory = "plots/heatmaps/"
+        os.makedirs(directory, exist_ok=True)
         for outpath, layer_stats in zip(output_paths, [self.layer_stats_w, self.layer_stats_grad]):
-            with open("plots/" + outpath, "w") as f:
+            with open(directory + outpath, "w") as f:
                 serializable_stats = [
                     {k: float(v) if hasattr(v, 'item') and hasattr(v, 'dtype') else v for k, v in entry.items()}
                     for entry in layer_stats
                 ]
                 json.dump(serializable_stats, f)
-                assert outpath in os.listdir('plots/')
+                assert outpath in os.listdir(directory)
         print("✅ Layer stats saved to plot folder")
 
     def finalize_and_visualize(self):
@@ -171,7 +191,8 @@ class reduced_precision_trainer():
             if not visualized:
                 print("\n📸  Visual sanity-check after first training step\n")
                 preds = torch.argmax(outputs, dim=1).cpu()
-                os.makedirs("plots/start_of_training_check", exist_ok=True)
+                directory = "plots/start_of_training_check/"
+                os.makedirs(directory, exist_ok=True)
                 save_visual_predictions(
                     images=images.cpu(),
                     targets=targets,
@@ -180,7 +201,7 @@ class reduced_precision_trainer():
                     task=task,
                     num_classes=num_classes,
                     category_id_to_class_idx=self.category_id_to_class_idx,
-                    save_prefix="plots/start_of_training_check"
+                    save_prefix=directory
                 )
                 visualized = True                 # ← flip flag so we don’t repeat
 
@@ -248,7 +269,7 @@ class reduced_precision_trainer():
 
     def run(self):
         print("start initial mask check, before training")
-        check_mask(128)
+        check_mask(self.config.seeds)
 
         if self.config.enable_logging: 
             wandb.init(project="unet-fp16-coco", name = "smaller model, new loss", config=asdict(self.config))
@@ -278,15 +299,17 @@ class reduced_precision_trainer():
             num_classes = len(self.category_id_to_class_idx)  # ✅ safer, consistent
 
             
-        kf = KFold(n_splits=5, shuffle=True, random_state=40)
+        kf = KFold(n_splits=5, shuffle=True, random_state=self.config.seeds)
 
         for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(len(dataset)))):
             print(f"Fold {fold + 1}/5")
             train_subset = Subset(dataset, train_idx.tolist())
             val_subset = Subset(dataset, val_idx.tolist())
 
-            train_loader = DataLoader(train_subset, batch_size=self.config.batch_size, shuffle=True, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
-            val_loader = DataLoader(val_subset, batch_size=self.config.batch_size, shuffle=False, num_workers=4, collate_fn=coco_collate_fn, pin_memory=True)
+            train_loader = DataLoader(train_subset, batch_size=self.config.batch_size, shuffle=True, num_workers=4, 
+                                      collate_fn=coco_collate_fn, pin_memory=True, generator=g, worker_init_fn=seed_worker)
+            val_loader = DataLoader(val_subset, batch_size=self.config.batch_size, shuffle=False, num_workers=4, 
+                                    collate_fn=coco_collate_fn, pin_memory=True, generator=g, worker_init_fn=seed_worker)
 
             print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
 

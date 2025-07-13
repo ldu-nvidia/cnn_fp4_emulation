@@ -21,6 +21,7 @@ class TrainingConfig:
     log_weights: bool = True
     log_grads: bool = False
     visualize_val: bool = True
+    seeds: int = 31
     
     # Debug parameters
     debug: bool = True
@@ -62,6 +63,8 @@ def parse_args() -> TrainingConfig:
     parser.add_argument('--log_weights', action='store_true', default=TrainingConfig.log_weights)
     parser.add_argument('--log_grads', action='store_true', default=TrainingConfig.log_grads)
     parser.add_argument('--visualize_val', action='store_true', default=TrainingConfig.visualize_val)
+
+    
 
     
     # Debug parameters

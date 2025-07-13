@@ -4,9 +4,8 @@ import os
 import plotly.graph_objects as go
 
 def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
-    os.makedirs("plots/heatmaps", exist_ok=True)
+    os.makedirs("plots/heatmaps/", exist_ok=True)
     out_path = "plots/heatmaps/" + args.task + "_" + type + ".png"
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     steps = tensor.shape[0]
     fig, axs = plt.subplots(len(stat_names), 1, figsize=(15, 10 * len(stat_names)), squeeze=False)
     for i, stat in enumerate(stat_names):
