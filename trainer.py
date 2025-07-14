@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.optim
+import torch.utils.data
 from torch.utils.data import DataLoader, random_split, Subset
 from torchvision import transforms
 from torchvision.datasets import CocoDetection
@@ -21,14 +22,18 @@ from config import configs
 from dataclasses import asdict
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+from torchmetrics.functional import jaccard_index
 from models.baseline import UNetFP16 
-from utils import rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
+import shutil
+from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
     coco_collate_fn, count_parameters, get_max_category_id, combined_loss, visualize_instance_batch, \
     get_max_instances_from_annotations, log_visual_predictions_to_file, check_mask, save_visual_predictions, \
-        get_coco, get_max_instances_from_annotations, plot_grid_heatmaps, plot_interactive_3d
+        get_coco, get_max_instances_from_annotations, plot_grid_heatmaps, plot_interactive_3d, dice_coeff, \
+            save_predictions_for_visualization, miou, instance_iou)
+
 from loss import DiceLoss, instance_loss
 
-SEED = 8        # pick any integer you like ────────────────┐
+SEED =321     # pick any integer you like ────────────────┐
 torch.manual_seed(SEED)       # <- torch CPU ops                │
 random.seed(SEED)             # <- python.random                │
 np.random.seed(SEED)          # <- NumPy                        │
@@ -53,6 +58,11 @@ class reduced_precision_trainer():
         self.layer_stats_w = []
         self.layer_stats_grad = []
         self.config = config
+        self.model = None
+        self.optimizer = None
+        self.scaler = None
+        self.ce_loss = None
+        self.dice_loss = None
 
     def log_telemetry(self, model, loss_value, step):
         if step % self.config.logf != 0:
@@ -63,7 +73,6 @@ class reduced_precision_trainer():
             print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
             return
         wandb.log({"loss": loss_value}, step=step)
-
         for name, param in model.named_parameters():
             new_name = rename(name)
             if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
@@ -71,10 +80,7 @@ class reduced_precision_trainer():
                 if np.isfinite(w).all():
                     stat_dict_w[new_name + "/mean"] = np.mean(w)
                     stat_dict_w[new_name + "/std"] = np.std(w)
-                    if np.std(w) > 1e-6:
-                        stat_dict_w[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
-                    else:
-                        stat_dict_w[new_name + "/kurtosis"] = 0.0  
+                    stat_dict_w[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
                     wandb.log({new_name: wandb.Histogram(w)}, step=step)
 
             if param.requires_grad and param.grad is not None and 'bias' not in new_name and 'weight' in new_name:
@@ -82,10 +88,7 @@ class reduced_precision_trainer():
                 if np.isfinite(w).all():
                     stat_dict_grad[new_name + "/mean"] = np.mean(w)
                     stat_dict_grad[new_name + "/std"] = np.std(w)
-                    if np.std(w) > 1e-6:
-                        stat_dict_grad[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
-                    else:
-                        stat_dict_grad[new_name + "/kurtosis"] = 0.0
+                    stat_dict_grad[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
                     wandb.log({new_name: wandb.Histogram(w)}, step=step)
 
         stat_dict_w['step'], stat_dict_grad['step'] = step, step
@@ -108,7 +111,8 @@ class reduced_precision_trainer():
 
     def finalize_and_visualize(self):
         print("\n finalizing and visualizing \n")
-        assert len(self.layer_stats_w) != 0 and len(self.layer_stats_w) != 0, "weight or grad stats are empty"
+        assert len(self.layer_stats_w) != 0 and len(self.layer_stats_grad) != 0, "weight or grad stats are empty"
+        print("saving layer stats")
         self.save_layer_stats()
         for layer_stats, type in zip([self.layer_stats_w, self.layer_stats_grad], ['weights', 'grads']):
             keys = sorted(k for k in layer_stats[0].keys() if k != 'step')
@@ -130,210 +134,212 @@ class reduced_precision_trainer():
             print("✅ Plots saved to plot folder")
         print("\n task finished \n")
 
-    def train_one_epoch(
-            self, model, dataloader, ce_criterion, dice_crition,
-            optimizer, device, step_start, task, num_classes, scaler
-    ):
-        model.train()
-        running_loss = 0.0
-        step = step_start
-        visualized = False                     # ← visualize only once
+    def compute_batch_instance_iou(self, pred_mask, gt_mask):
+        pred_mask = (pred_mask > 0).float()
+        gt_mask = (gt_mask > 0).float()
+        intersection = torch.sum((pred_mask == 1) & (gt_mask == 1))
+        union = torch.sum(pred_mask == 1) + torch.sum(gt_mask == 1)
+        return (2.0 * intersection / (union + 1e-6)).item()
 
-        for images, targets in dataloader:
-            images = images.to(device)
-
-            # ─── Forward pass (AMP) ─────────────────────────────────────────────────
+    def train_one_epoch(self, train_loader, device, global_step, task, num_cls):
+        self.model.train()
+        tr_loss, dice_sum, iou, inst_iou_sum, batches = 0.0, 0.0, 0.0, 0.0, 0
+        step0 = global_step
+        for imgs, tgts in train_loader:
+            imgs = imgs.to(device)
             with autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(images)
-                h, w = outputs.shape[2:]
+                outs = self.model(imgs)
+                H, W = outs.shape[2:]
 
                 if task == "semantic":
-                    gt = parse_segmentation_masks(
-                        targets, h, w, num_classes, self.category_id_to_class_idx
-                    ).to(device)
-                    loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
-                    assert (
-                        gt.shape[-2:] == outputs.shape[-2:]
-                        and gt.shape[1] == num_classes
-                    ), "GT tensor shape mismatch with outputs or num_classes for semantic task"
-
-                elif task == "detection":
-                    gt = parse_detection_heatmap(targets, h, w).to(device)
-                    loss = torch.zeros([], device=device)
-
+                    gt = parse_segmentation_masks(tgts, H, W, num_cls, self.cat2idx).to(device)
+                    loss = combined_loss(outs, gt, self.ce_loss, self.dice_loss)
+                    preds = outs.argmax(1)
+                    gt_lbl = gt.argmax(1)
+                    dice_sum += dice_coeff(preds.cpu(), gt_lbl.cpu())
 
                 elif task == "instance":
-                    batch_masks, _ = parse_instance_masks(
-                        targets, h, w, self.category_id_to_class_idx
-                    )
-                    batch_masks = [m.to(device) for m in batch_masks]
-                    loss = instance_loss(outputs, batch_masks)
-                    assert (all(m.shape[-2:] == outputs.shape[-2:] for m in batch_masks)), "GT tensor shape mismatch with outputs for instance task"
+                    masks, _ = parse_instance_masks(tgts, H, W, self.cat2idx)
+                    masks = [m.to(device) for m in masks]
+                    ins_loss_fn = instance_loss()
+                    loss = ins_loss_fn(outs, masks)
 
+                    preds = outs.argmax(1)
+                    for p, g in zip(preds, masks):
+                        pred_mask = (p > 0).float()
+                        gt_mask = (g.sum(dim=0) > 0).float()
+                        iou = self.compute_batch_instance_iou(pred_mask, gt_mask)
+                        inst_iou_sum += iou
                 else:
-                    raise ValueError("Unsupported task")
+                    loss = torch.zeros([], device=device)
 
-            # ─── Back-prop & optimiser step ───────────────────────────────────────
-            if not isinstance(loss, torch.Tensor):
-                loss = torch.tensor(loss, device=device)
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
-            if not torch.isfinite(loss):
-                print(f"⚠️  skipping non-finite loss at step {step}")
-                continue
-
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-            # ─── One-off visual check after first step ────────────────────────────
-            if not visualized:
-                print("\n📸  Visual sanity-check after first training step\n")
-                preds = torch.argmax(outputs, dim=1).cpu()
-                directory = "plots/start_of_training_check/"
-                os.makedirs(directory, exist_ok=True)
-                save_visual_predictions(
-                    images=images.cpu(),
-                    targets=targets,
-                    preds=preds,
-                    config=self.config,
-                    task=task,
-                    num_classes=num_classes,
-                    category_id_to_class_idx=self.category_id_to_class_idx,
-                    save_prefix=directory
-                )
-                visualized = True                 # ← flip flag so we don’t repeat
-
-            # ─── Book-keeping ─────────────────────────────────────────────────────
-            running_loss += loss.item()
-            if self.config.enable_logging:
-                self.log_telemetry(model, loss.item(), step)
-            step += 1
-
-            if step == 100:                       # your early-break for debugging
+            global_step += 1
+            if global_step == step0 + 60:
                 break
+            
+            tr_loss += loss.item()
+            batches += 1
 
-        return running_loss / len(dataloader), step
+            if self.config.enable_logging and global_step > 0 and global_step % self.config.logf == 0:
+                self.log_telemetry(self.model, loss.item(), global_step)
+                if task == "instance":
+                    wandb.log({"train/instance_iou": iou}, step=global_step)
+                wandb.log({"train/loss": loss.item()}, step=global_step)
+
+        avg_dice = dice_sum / max(batches, 1) if task == "semantic" else None
+        avg_iou = inst_iou_sum / max(batches, 1) if task == "instance" else None
+        return tr_loss / max(batches, 1), avg_dice, avg_iou, global_step
 
 
-    def validate(self, model, dataloader, ce_criterion, dice_crition, device, step_start, task, num_classes):
+    # ------------------------ Validation --------------------------------
+    # ----------------------------------------------------------------------
+
+    def validate(self, model, loader, ce, dice_loss,
+                dev, step0, task, num_cls):
         model.eval()
-        val_loss = 0.0
-        step = step_start
+        print("validating")
+        loss   = dice_sum = miou_sum = inst_iou_sum = 0.0
+        step    = step0
+        batches = 0
+
         with torch.no_grad():
-            for images, targets in dataloader:
-                images = images.to(device)
+            for imgs, tgts in loader:
+                imgs = imgs.to(dev)
                 with autocast(device_type='cuda', dtype=torch.float16):
-                    outputs = model(images)
-                    height, width = outputs.shape[2:]
+                    outs = model(imgs)                         # [B,C,H,W]
+                    H, W = outs.shape[2:]
 
                     if task == "semantic":
-                        gt = parse_segmentation_masks(targets, height, width, num_classes, self.category_id_to_class_idx).to(device)
-                    elif task == "detection":
-                        gt = parse_detection_heatmap(targets, height, width).to(device)
+                        gt   = parse_segmentation_masks(
+                                tgts, H, W, num_cls, self.cat2idx).to(dev)
+                        loss = combined_loss(outs, gt, ce, dice_loss)
+
+                        preds   = outs.argmax(1)               # still on GPU
+                        gt_lbl  = gt.argmax(1)
+                        dice_sum += dice_coeff(preds.cpu(), gt_lbl.cpu())
+                        miou_sum += jaccard_index(
+                                        preds, gt_lbl,
+                                        num_classes=num_cls,
+                                        task='multiclass',
+                                        average='micro'
+                                    ).item()
+                        batches += 1
+
                     elif task == "instance":
-                        continue
-                    else:
-                        raise ValueError("Unsupported task.")
+                        masks, _ = parse_instance_masks(tgts, H, W, self.cat2idx)
+                        masks = [m.to(dev) for m in masks]
+                        ins_loss = instance_loss()
+                        loss = ins_loss(outs, masks)
 
-                    if outputs.shape[1] != gt.shape[1]:
-                        raise ValueError(f"Mismatch: model output channels = {outputs.shape[1]}, target = {gt.shape[1]}")
+                        preds = outs.argmax(1)  # [B,H,W], still on GPU
+                        for p, g in zip(preds, masks):
+                            # Ensure g is on the same device as preds
+                            g = g.to(p.device)
 
-                    loss = combined_loss(outputs, gt, ce_criterion, dice_crition)
-                    if not torch.isfinite(loss):
-                        print(f"⚠️ Skipping validation step due to non-finite loss at step {step}")
-                        continue
+                            # Merge all instance masks into one binary mask
+                            pred_mask = (p > 0).float()
+                            gt_mask = (g.sum(dim=0) > 0).float()
 
-                    val_loss += loss.item()
-                    wandb.log({"val/loss": loss.item()}, step=step)
-                    step += 1
-                    if step == step_start + 20:
-                        break
-        
-        if self.config.enable_logging and self.config.visualize_val:
-            assert self.config.task in ["semantic", "instance"], \
-                f"Unsupported task type: {self.config.task}"
-            print("\n start validating data after validation step \n")
-            log_visual_predictions_to_file(
-                self.config,
-                model,
-                dataloader,
-                device=device,
-                num_classes=num_classes,
-                category_id_to_class_idx=self.category_id_to_class_idx
-            )
+                            # Optional: print unique values for debug
+                            #print(f"[val] pred unique: {p.unique()}, gt merged unique: {gt_mask.unique()}")
 
-        # Ensure validate always returns a tuple (val_loss, step)
-        return val_loss / max(len(dataloader), 1), step
+                            # Compute IoU between binary masks
+                            intersection = torch.sum((pred_mask == 1) & (gt_mask == 1))
+                            union        = torch.sum(pred_mask == 1) + torch.sum(gt_mask == 1)
+                            batch_iou = (2.0 * intersection / (union + 1e-6)).item()
+                            inst_iou_sum += batch_iou
+                            #print(f"[val] batch instance IoU: {batch_iou:.4f}")
+                            batches += 1
+                    else:   # detection
+                        gt   = parse_detection_heatmap(tgts, H, W).to(dev)
+                        loss = torch.zeros([], device=dev)
 
+                loss += loss.item()
+                step  += 1
+
+        # ---- average metrics -----------------------------------------------
+        loss   /= max(batches, 1)
+        dice_av = dice_sum   / max(batches, 1)
+        miou_av = miou_sum   / max(batches, 1)
+        inst_av = inst_iou_sum / max(batches, 1)
+
+        if self.config.enable_logging:
+            if task == "semantic":
+                wandb.log({"val/dice": dice_av, "val/miou": miou_av}, step=step)
+            elif task == "instance":
+                wandb.log({"val/instance_iou": inst_av}, step=step)
+            wandb.log({"val/loss": loss}, step = step)
+        return loss, step
+
+
+    # ---------------------------- run() ---------------------------------
     def run(self):
-        print("start initial mask check, before training")
-        check_mask(self.config.seeds)
+        print("start initial mask check");  check_mask(int(SEED))
 
-        if self.config.enable_logging: 
-            wandb.init(project="unet-fp16-coco", name = "smaller model, new loss", config=asdict(self.config))
+        if self.config.enable_logging:
+            wandb.init(project="unet-fp16-coco",
+                       name=self.config.wandb_name,
+                       config=asdict(self.config))
+
         device = torch.device("cuda:1")
-
-        # get category to class index mapping once as global variable
-        coco = get_coco(self.config.ann_file)               # loads once
-        category_ids = sorted(coco.getCatIds())
-        self.category_id_to_class_idx = {cat: i for i, cat in enumerate(category_ids)}
+        coco = get_coco(self.config.ann_file)
+        cat_ids = sorted(coco.getCatIds())
+        self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
 
         dataset = CocoSegmentationDataset(
             img_root=self.config.coco_root,
             ann_file=self.config.ann_file,
-            category_id_to_class_idx=self.category_id_to_class_idx,
-            target_size=(256, 256)
-        )
-        
-        # for semantic segmentation, we need to know the number of classes, and no num_instances
+            category_id_to_class_idx=self.cat2idx,
+            target_size=(256, 256))
+
         if self.config.task == "semantic":
-            num_classes = len(self.category_id_to_class_idx)
-            num_instances = -1
-        
-        # for instance segmentation, we need to know the number of instances, and no num_classes
-        if self.config.task == "instance":
-            num_instances = get_max_instances_from_annotations(self.config.ann_file)
-            print(f"Max number of instances per image = {num_instances}")
-            num_classes = len(self.category_id_to_class_idx)  # ✅ safer, consistent
+            num_cls, num_inst = len(self.cat2idx), -1
+        elif self.config.task == "instance":
+            num_inst = get_max_instances_from_annotations(self.config.ann_file)
+            num_cls  = len(self.cat2idx)
+            print(f"Max instances / image = {num_inst}")
+        else:
+            raise ValueError("Unsupported task type")
 
+        val_frac = 0.0005
+        val_len = int(val_frac * len(dataset))
+        train_len = len(dataset) - val_len
+        train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=g)
+
+        train_loader = DataLoader(train_set, batch_size=self.config.batch_size, shuffle=True,
+            num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
+            generator=g, worker_init_fn=seed_worker)
+
+        val_loader = DataLoader(val_set, batch_size=self.config.batch_size, shuffle=False,
+            num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
+            generator=g, worker_init_fn=seed_worker)
+
+        self.model = UNetFP16(task=self.config.task, in_channels=3,
+                              out_channels=num_cls, num_instances=num_inst).to(device)
+        count_parameters(self.model)
+
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.dice_loss = DiceLoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(),
+                                          lr=self.config.lr, weight_decay=1e-5)
+        self.scaler = GradScaler(device='cuda')
+
+        global_step = 0
+        for epoch in range(self.config.epochs):
+            print(f"\nEpoch {epoch}")
+            tr_loss, tr_dice, tr_iou, global_step = self.train_one_epoch(train_loader, device, global_step, self.config.task, num_cls)
+
+            vl_loss, global_step = self.validate(self.model, val_loader, self.ce_loss, self.dice_loss, device, global_step, self.config.task, num_cls)
+            print("per epoch loss: ", tr_loss, " per epoch dice: ", tr_dice, " per epoch iou: ", tr_iou, " per epoch val loss: ", vl_loss)
+
+            print("saving predictions for visualization after validation step")
+            save_predictions_for_visualization(self.model, val_loader, device, self.config.task, self.cat2idx, epoch)
             
-        kf = KFold(n_splits=5, shuffle=True, random_state=self.config.seeds)
-
-        for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(len(dataset)))):
-            print(f"Fold {fold + 1}/5")
-            train_subset = Subset(dataset, train_idx.tolist())
-            val_subset = Subset(dataset, val_idx.tolist())
-
-            train_loader = DataLoader(train_subset, batch_size=self.config.batch_size, shuffle=True, num_workers=4, 
-                                      collate_fn=coco_collate_fn, pin_memory=True, generator=g, worker_init_fn=seed_worker)
-            val_loader = DataLoader(val_subset, batch_size=self.config.batch_size, shuffle=False, num_workers=4, 
-                                    collate_fn=coco_collate_fn, pin_memory=True, generator=g, worker_init_fn=seed_worker)
-
-            print(f"[Fold {fold+1}] Dataset-wide num_classes = {num_classes}")
-
-            model = UNetFP16(task=self.config.task, in_channels=3, out_channels=num_classes, num_instances=num_instances).to(device)
-            print("size of the model: ", count_parameters(model))
-            ce_criterion = nn.CrossEntropyLoss()
-            dice_crition = DiceLoss()
-            optimizer = torch.optim.Adam(model.parameters(), lr=self.config.lr, weight_decay=1e-5)
-            scaler = GradScaler(device='cuda')
-
-            step = 0
-            for epoch in range(self.config.epochs):
-                print("training, epoch: ", epoch)
-                train_loss, step = self.train_one_epoch(model, train_loader, ce_criterion, dice_crition, optimizer, device, step, self.config.task, num_classes, scaler)
-                print("validating, epoch: ", epoch)
-                val_loss, step = self.validate(model, val_loader, ce_criterion, dice_crition, device, step, self.config.task, num_classes)
-                print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
-                if self.config.enable_logging:
-                    wandb.log({"epoch": epoch + 1, "train/avg_loss": train_loss, "val/avg_loss": val_loss}, step=step)
-                if self.config.debug:
-                    break
-
-            torch.save(model.state_dict(), f"unet_fold{fold + 1}.pth")
-            if self.config.debug:
-                break
-
+        torch.save(self.model.state_dict(), "unet_final.pth")
         self.finalize_and_visualize()

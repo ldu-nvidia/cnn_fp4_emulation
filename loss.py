@@ -22,28 +22,46 @@ class DiceLoss(nn.Module):
         return 1.0 - dice_score.mean()
 
 
-def instance_loss(pred_masks, gt_masks):
-    assert isinstance(pred_masks, torch.Tensor), "pred_masks must be a tensor"
-    assert isinstance(gt_masks, list), "gt_masks must be a list of tensors"
-    assert pred_masks.ndim == 4, "pred_masks should have shape [B, N_pred, H, W]"
-    for gt in gt_masks:
-        assert isinstance(gt, torch.Tensor), "Each ground truth in gt_masks must be a tensor"
-        assert gt.ndim == 3, "Each gt mask should have shape [N_gt, H, W]"
-        assert gt.shape[1:] == pred_masks.shape[2:], f"GT mask shape {gt.shape[1:]} must match prediction shape {pred_masks.shape[2:]}"
+class instance_loss(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-    loss = 0.0
-    count = 0
-    for pred, gt in zip(pred_masks, gt_masks):
-        N_gt = gt.shape[0]
-        N_pred = pred.shape[0]
-        if N_gt == 0 or N_pred == 0:
-            continue
-        gt = gt.to(pred.device)
-        losses = []
-        for i in range(N_gt):
-            expanded_gt = gt[i].unsqueeze(0).expand_as(pred)
-            losses.append(F.binary_cross_entropy_with_logits(pred, expanded_gt))
-        loss += min(losses)
-        count += 1
-    return loss / max(count, 1)
+    def forward(self, pred_masks, gt_masks):
+        # Validate input types and shapes
+        assert isinstance(pred_masks, torch.Tensor), "pred_masks must be a tensor"
+        assert isinstance(gt_masks, list), "gt_masks must be a list of tensors"
+        assert pred_masks.ndim == 4, f"Expected pred_masks shape [B,C,H,W], got {pred_masks.shape}"
 
+        B, C, H, W = pred_masks.shape
+        for i, gt in enumerate(gt_masks):
+            assert isinstance(gt, torch.Tensor), f"gt_masks[{i}] must be a tensor"
+            assert gt.ndim == 3, f"Each gt_mask[{i}] should have shape [N,H,W], got {gt.shape}"
+            assert gt.shape[1:] == (H, W), f"gt_masks[{i}] spatial dims {gt.shape[1:]} != pred spatial dims {(H,W)}"
+
+        total_loss = 0.0
+        valid_samples = 0
+
+        for idx, (pred, gt) in enumerate(zip(pred_masks, gt_masks)):
+            # pred: [C,H,W], gt: [N,H,W]
+            assert pred.ndim == 3, f"Expected pred shape [C,H,W], got {pred.shape}"
+            N_gt = gt.shape[0]
+            if N_gt == 0 or C == 0:
+                continue
+
+            # Expand gt masks to match pred channels
+            # BCE expects [C,H,W] vs [C,H,W]
+            # We'll compute BCE between each GT instance and all predicted logits
+            gt = gt.to(pred.device)
+            bce_losses = []
+            for i in range(N_gt):
+                gt_i = gt[i].unsqueeze(0).expand(C, H, W)  # shape [C,H,W]
+                bce_loss = F.binary_cross_entropy_with_logits(pred, gt_i)
+                bce_losses.append(bce_loss)
+
+            # Take min loss across GTs for this prediction
+            total_loss += torch.stack(bce_losses).min()
+            valid_samples += 1
+
+        # Normalize
+        avg_loss = total_loss / max(valid_samples, 1)
+        return avg_loss

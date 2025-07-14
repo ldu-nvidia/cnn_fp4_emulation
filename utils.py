@@ -10,7 +10,9 @@ import os
 from PIL import Image
 import matplotlib.cm as cm
 import plotly.graph_objects as go
-
+from scipy.optimize import linear_sum_assignment
+from torchvision.utils import draw_segmentation_masks
+from torchvision.transforms.functional import to_pil_image
 
 # note relu layer has no weight or bias
 block_to_layer_dict = {'0': "conv2d_1st",
@@ -52,7 +54,7 @@ def visualize_instance_batch(image_np, pred_mask, gt_masks, gt_classes, num_clas
         if len(x_indices) > 0 and len(y_indices) > 0:
             x1, y1 = np.min(x_indices), np.min(y_indices)
             x2, y2 = np.max(x_indices), np.max(y_indices)
-            rect = mpatches.Rectangle((x1, y1), x2 - x1, y2 - y1,
+            rect = mpatches.Rectangle((float(x1), float(y1)), float(x2 - x1), float(y2 - y1),
                                       linewidth=1, edgecolor=color, facecolor='none')
             axes[2].add_patch(rect)
 
@@ -159,6 +161,7 @@ def combined_loss(logits, targets, ce_criterion, dice_criterion):
 def save_visual_predictions(images, targets, preds, config, task, num_classes, category_id_to_class_idx, save_prefix="train_step"):
     height, width = preds.shape[1:]
     B = images.size(0)
+    os.makedirs(save_prefix, exist_ok=True)
 
     if task == "instance":
         for i in range(min(2, B)):
@@ -183,7 +186,7 @@ def save_visual_predictions(images, targets, preds, config, task, num_classes, c
             axes[2].set_title("Ground Truth")
             for ax in axes: ax.axis("off")
             fig.tight_layout()
-            fig.savefig(f"{save_prefix}_semantic_{i}.png")
+            fig.savefig(f"{save_prefix}semantic_{i}.png")
             plt.close(fig)
 
 
@@ -250,70 +253,66 @@ def log_visual_predictions_to_file(
             fig.savefig(out_path)
             print(f"Saved: {out_path}")
             plt.close(fig)
+        
 
+def check_mask(img_idx: int,
+               img_root="coco2017/images/train2017",
+               ann_file="coco2017/annotations/instances_train2017.json"):
+    """
+    Quick visual sanity-check of one COCO image + masks after resizing.
 
-def check_mask(img_id):
-    # --- Configuration ---
-    img_root = "coco2017/images/train2017"
-    ann_file = "coco2017/annotations/instances_train2017.json"
-    output_sem_path = "semantic_mask_check.png"
-    output_inst_path = "instance_mask_check.png"
+    Saves two PNGs in plots/initial_check/
+        • semantic_mask_check.png  (category-ID heat-map)
+        • instance_mask_check.png  (random colour per instance)
+    """
+    # ------------------ I/O paths --------------------------------------
+    os.makedirs("plots/", exist_ok=True)
+    out_dir = "plots/initial_check/"
+    os.makedirs(out_dir, exist_ok=True)
+    sem_path = os.path.join(out_dir, "semantic_mask_check.png")
+    ins_path = os.path.join(out_dir, "instance_mask_check.png")
 
-    # --- Load COCO annotations ---
-    coco = COCO(ann_file)
-    img_ids = coco.getImgIds()
-    img_id = img_ids[img_id]  # just pick the first image for demo
-    img_info = coco.loadImgs(img_id)[0]
+    # ------------------ COCO & image meta ------------------------------
+    coco   = COCO(ann_file)
+    img_id = coco.getImgIds()[img_idx]
+    info   = coco.loadImgs(img_id)[0]              # dict with H,W & filename
 
-    # --- Load image ---
-    img_path = os.path.join(img_root, img_info['file_name'])
-    image = Image.open(img_path).convert("RGB")
-    width, height = image.size
-    image_np = np.array(image)
+    image  = Image.open(os.path.join(img_root, info["file_name"])).convert("RGB")
+    W, H   = image.size
+    img_np = np.array(image)
 
-    # --- Load annotations ---
     ann_ids = coco.getAnnIds(imgIds=img_id)
-    anns = coco.loadAnns(ann_ids)
+    anns    = coco.loadAnns(ann_ids)
 
-    # --- Semantic mask ---
-    sem_mask = np.zeros((height, width), dtype=np.uint8)
-    # --- Instance mask (color-coded by instance id) ---
-    inst_mask = np.zeros((height, width), dtype=np.int32)
+    # ------------------ allocate masks --------------------------------
+    sem_mask  = np.zeros((H, W), dtype=np.uint8)   # category-id  per pixel
+    inst_mask = np.zeros((H, W), dtype=np.int32)   # small ID      per pixel
 
-    for idx, ann in enumerate(anns):
+    # ------------------ fill masks ------------------------------------
+    for idx, ann in enumerate(anns, start=1):      # idx = 1,2,3…
+        # annToMask handles polygons & RLE transparently
+        binary = coco.annToMask(ann)               # ndarray H×W (0/1)
+        assert binary.shape == (H, W), "Mask size mismatch"
+
         cat_id = ann["category_id"]
-        inst_id = ann["id"]
-        if ann.get("iscrowd", 0):
-            rle = ann["segmentation"]
-        else:
-            rle = coco_mask.frPyObjects(ann["segmentation"], height, width)
+        sem_mask[binary > 0]  = cat_id
+        inst_mask[binary > 0] = idx                # safe small integer
 
-        binary_mask = coco_mask.decode(rle)
-        if binary_mask.ndim == 3:
-            binary_mask = np.any(binary_mask, axis=2)
+    # ------------------ save semantic visual --------------------------
+    norm = sem_mask.astype(float) / max(1, sem_mask.max())
+    sem_rgb = (cm.nipy_spectral(norm)[..., :3] * 255).astype(np.uint8)
+    Image.fromarray(sem_rgb).save(sem_path)
 
-        sem_mask[binary_mask > 0] = cat_id
-        inst_mask[binary_mask > 0] = inst_id  # unique per instance
+    # ------------------ save instance visual --------------------------
+    rand_col = np.random.randint(0, 255,
+                                 (inst_mask.max() + 1, 3),
+                                 dtype=np.uint8)
+    inst_rgb = rand_col[inst_mask]
+    overlay  = (0.2 * img_np + 0.8 * inst_rgb).astype(np.uint8)
+    Image.fromarray(overlay).save(ins_path)
 
-    os.makedirs("plots/initial_check", exist_ok=True)
-    # --- Save semantic segmentation visualization ---
-    norm_sem_mask = sem_mask.astype(float)
-    norm_sem_mask /= max(1, norm_sem_mask.max())  # normalize to [0,1]
-    sem_color = (cm.nipy_spectral(norm_sem_mask)[:, :, :3] * 255).astype(np.uint8)
-    sem_image = Image.fromarray(sem_color)
-    sem_image.save("plots/initial_check/"+output_sem_path)
-
-    # --- Save instance segmentation visualization ---
-    rand_colors = np.random.randint(0, 255, (inst_mask.max() + 1, 3), dtype=np.uint8)
-    inst_rgb = rand_colors[inst_mask]
-    overlay = (0.2 * image_np + 0.8 * inst_rgb).astype(np.uint8)
-    inst_image = Image.fromarray(overlay)
-    inst_image.save("plots/initial_check/"+output_inst_path)
-
-    print(f"✅ Saved initial semantic mask to {output_sem_path}")
-    print(f"✅ Saved initial instance overlay to {output_inst_path}\n\n")
-
-
+    print(f"✅ Semantic mask saved  ➜  {sem_path}")
+    print(f"✅ Instance mask saved  ➜  {ins_path}\n")
 
 def get_coco(ann_file):
     if ann_file not in _COCO_CACHE:
@@ -327,7 +326,6 @@ def get_max_instances_from_annotations(ann_file):
 def get_max_category_id(ann_file):
     coco = get_coco(ann_file)
     return max(coco.getCatIds())
-
 
 def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
     os.makedirs("plots/heatmaps/", exist_ok=True)
@@ -364,4 +362,104 @@ def plot_interactive_3d(tensor, layer_names, stat_names, args, type):
         zaxis_title="Stat Value",
         yaxis=dict(tickmode='array', tickvals=list(range(len(layer_names))), ticktext=layer_names)
     ))
-    fig.write_html(out_path)
+    fig.write_html(out_path) # or appropriate import
+
+# Fixed palette of distinct colors (R, G, B) for consistent class/instance mapping
+COLOR_PALETTE = [
+    (255, 0, 0),     # red
+    (0, 255, 0),     # green
+    (0, 0, 255),     # blue
+    (255, 255, 0),   # yellow
+    ]
+
+def get_color(index):
+    """Deterministic color assignment based on index"""
+    return COLOR_PALETTE[index % len(COLOR_PALETTE)]
+
+def save_predictions_for_visualization(model, val_loader, device, task, cat2idx, epoch):
+    print("saving predictions for visualization after validation step")
+    model.eval()
+    os.makedirs("plots/val_output", exist_ok=True)
+
+    with torch.no_grad():
+        for batch_idx, (imgs, tgts) in enumerate(val_loader):
+            imgs = imgs.to(device)
+            outs = model(imgs)
+            preds = outs.argmax(1)
+
+            for i in range(min(len(imgs), 4)):  # save 2 examples
+                img = TF.to_pil_image(imgs[i].cpu())
+                img_tensor = TF.to_tensor(img)
+
+                H, W = outs.shape[2:]
+                if task == "semantic":
+                    gt = parse_segmentation_masks([tgts[i]], H, W, len(cat2idx), cat2idx).argmax(1)[0]
+                    pred = preds[i].cpu()
+
+                    # build binary masks per class
+                    gt_masks = [(gt == k) for k in gt.unique() if k.item() > 0]
+                    pred_masks = [(pred == k) for k in pred.unique() if k.item() > 0]
+
+                    gt_colors = [get_color(k.item()) for k in gt.unique() if k.item() > 0]
+                    pred_colors = [get_color(k.item()) for k in pred.unique() if k.item() > 0]
+
+                    gt_overlay = draw_segmentation_masks(img_tensor.clone(), gt_masks, alpha=0.5, colors=gt_colors)
+                    pred_overlay = draw_segmentation_masks(img_tensor.clone(), pred_masks, alpha=0.5, colors=pred_colors)
+
+                elif task == "instance":
+                    masks, _ = parse_instance_masks([tgts[i]], H, W, cat2idx)
+                    masks = masks[0].cpu()
+                    pred = preds[i].cpu()
+
+                    gt_masks = [m.bool() for m in masks]
+                    pred_masks = [(pred == k) for k in pred.unique() if k.item() > 0]
+
+                    gt_colors = [get_color(j) for j in range(len(gt_masks))]
+                    pred_colors = [get_color(k.item()) for k in pred.unique() if k.item() > 0]
+
+                    gt_mask_tensor = torch.stack(gt_masks).to(torch.bool)
+                    pred_mask_tensor = torch.stack(pred_masks).to(torch.bool)
+
+                    gt_overlay = draw_segmentation_masks(img_tensor.clone(), gt_mask_tensor, alpha=0.5, colors=gt_colors)
+                    pred_overlay = draw_segmentation_masks(img_tensor.clone(), pred_mask_tensor, alpha=0.5, colors=pred_colors)
+                else:
+                    continue
+
+                # Save side-by-side GT and prediction
+                combined = torch.cat([gt_overlay, pred_overlay], dim=2)  # concat along width
+                out_img = TF.to_pil_image(combined)
+                out_img.save(f"plots/val_output/epoch{epoch}_sample{i}.png")
+            break  
+
+def dice_coeff(pred_mask: torch.Tensor, gt_mask: torch.Tensor, eps=1e-6):
+    """pred_mask/gt_mask:  [B,H,W] int tensors with class-ids."""
+    intersection = torch.sum((pred_mask == gt_mask) & (gt_mask > 0))
+    union        = torch.sum(gt_mask > 0) + torch.sum(pred_mask > 0)
+    return (2.0 * intersection + eps) / (union + eps)
+
+
+def miou(pred_mask: torch.Tensor, gt_mask: torch.Tensor, num_classes: int):
+    """Mean IoU over classes present in GT."""
+    ious = []
+    for c in range(1, num_classes):                 # skip background = 0
+        gt_c   = (gt_mask == c)
+        pred_c = (pred_mask == c)
+        if gt_c.sum() == 0 and pred_c.sum() == 0:
+            continue
+        inter = torch.logical_and(gt_c, pred_c).sum()
+        union = torch.logical_or (gt_c, pred_c).sum()
+        if union > 0: ious.append( (inter / union).item() )
+    return np.mean(ious) if ious else 0.0
+
+def instance_iou(pred_masks, gt_masks):
+    """pred_masks, gt_masks: [N,H,W] bool tensors"""
+    P, G = len(pred_masks), len(gt_masks)
+    iou_mat = torch.zeros((P, G))
+    for i,p in enumerate(pred_masks):
+        for j,g in enumerate(gt_masks):
+            inter = (p & g).sum()
+            union = (p | g).sum()
+            iou_mat[i,j] = inter.float() / union.float().clamp(min=1)
+    # best matching with Hungarian algorithm
+    row_ind, col_ind = linear_sum_assignment((-iou_mat).cpu())
+    return iou_mat[row_ind, col_ind].mean().item() if len(row_ind) else 0.0

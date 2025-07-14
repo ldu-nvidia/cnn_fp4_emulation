@@ -10,18 +10,19 @@ class TrainingConfig:
     ann_file: str = "coco2017/annotations/instances_train2017.json"
     
     # Training parameters
-    batch_size: int = 4
-    lr: float = 1e-4
-    epochs: int = 5
-    task: str = "instance"  # choices: semantic, instance, detection
+    batch_size: int = 8
+    lr: float = 5e-5
+    epochs: int = 2
+    task: str = "instance" 
+    wandb_name: str = "last test" # choices: semantic, instance, detection
     
     # Logging parameters
-    logf: int = 50
+    logf: int = 5
     enable_logging: bool = True
     log_weights: bool = True
     log_grads: bool = False
     visualize_val: bool = True
-    seeds: int = 31
+    seeds: int = 84
     
     # Debug parameters
     debug: bool = True
@@ -63,8 +64,6 @@ def parse_args() -> TrainingConfig:
     parser.add_argument('--log_weights', action='store_true', default=TrainingConfig.log_weights)
     parser.add_argument('--log_grads', action='store_true', default=TrainingConfig.log_grads)
     parser.add_argument('--visualize_val', action='store_true', default=TrainingConfig.visualize_val)
-
-    
 
     
     # Debug parameters
