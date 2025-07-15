@@ -10,19 +10,21 @@ class TrainingConfig:
     ann_file: str = "coco2017/annotations/instances_train2017.json"
     
     # Training parameters
-    batch_size: int = 8
+    batch_size: int = 16
     lr: float = 5e-5
-    epochs: int = 2
+    epochs: int = 5
     task: str = "instance" 
-    wandb_name: str = "last test" # choices: semantic, instance, detection
-    
+
+    wandb_name: str = "2 epochs full run" # choices: semantic, instance, detection
+    project_name: str = "instance segmentation full precision"
+
     # Logging parameters
-    logf: int = 5
+    logf: int = 10
     enable_logging: bool = True
     log_weights: bool = True
-    log_grads: bool = False
+    log_grads: bool = True
     visualize_val: bool = True
-    seeds: int = 84
+    seeds: int = 226
     
     # Debug parameters
     debug: bool = True

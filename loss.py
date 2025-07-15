@@ -23,45 +23,66 @@ class DiceLoss(nn.Module):
 
 
 class instance_loss(nn.Module):
+    """Hungarian-matched BCE loss for instance segmentation.
+
+    Arguments
+    ---------
+    pred_masks : Tensor  [B, C, H, W]   – raw logits per instance-channel.
+    gt_masks   : List[Tensor[N_i, H, W]] – binary GT masks for each image.
+
+    Behaviour
+    ---------
+    • Computes the BCE loss for every (channel, GT) pair.
+    • Uses Hungarian assignment to find the minimal-cost one-to-one matching.
+      Unmatched GTs/preds are ignored (could be penalised separately).
+    • Averages the matched losses over the batch and returns a scalar.
+    """
+
     def __init__(self):
         super().__init__()
 
-    def forward(self, pred_masks, gt_masks):
-        # Validate input types and shapes
-        assert isinstance(pred_masks, torch.Tensor), "pred_masks must be a tensor"
+    def forward(self, pred_masks: torch.Tensor, gt_masks: list[torch.Tensor]):
+        # ---- Input validation -------------------------------------------------
+        assert pred_masks.ndim == 4, "pred_masks must be [B,C,H,W]"
         assert isinstance(gt_masks, list), "gt_masks must be a list of tensors"
-        assert pred_masks.ndim == 4, f"Expected pred_masks shape [B,C,H,W], got {pred_masks.shape}"
 
         B, C, H, W = pred_masks.shape
-        for i, gt in enumerate(gt_masks):
-            assert isinstance(gt, torch.Tensor), f"gt_masks[{i}] must be a tensor"
-            assert gt.ndim == 3, f"Each gt_mask[{i}] should have shape [N,H,W], got {gt.shape}"
-            assert gt.shape[1:] == (H, W), f"gt_masks[{i}] spatial dims {gt.shape[1:]} != pred spatial dims {(H,W)}"
+        assert len(gt_masks) == B, "len(gt_masks) must equal batch size"
 
+        from scipy.optimize import linear_sum_assignment  # local import (SciPy already used elsewhere)
+
+        device = pred_masks.device
         total_loss = 0.0
-        valid_samples = 0
+        valid_imgs = 0
 
-        for idx, (pred, gt) in enumerate(zip(pred_masks, gt_masks)):
-            # pred: [C,H,W], gt: [N,H,W]
-            assert pred.ndim == 3, f"Expected pred shape [C,H,W], got {pred.shape}"
-            N_gt = gt.shape[0]
-            if N_gt == 0 or C == 0:
+        for preds_per_img, gts_per_img in zip(pred_masks, gt_masks):
+            # preds_per_img: [C,H,W]; gts_per_img: [N,H,W]
+            if gts_per_img.ndim != 3:
+                raise ValueError("Each element in gt_masks must be [N,H,W]")
+
+            N = gts_per_img.shape[0]
+            if N == 0:
+                # No GT instances – treat all predictions as background (target = 0)
+                bg_target = torch.zeros_like(preds_per_img)
+                loss_bg = F.binary_cross_entropy_with_logits(preds_per_img, bg_target)
+                total_loss += loss_bg
+                valid_imgs += 1
                 continue
 
-            # Expand gt masks to match pred channels
-            # BCE expects [C,H,W] vs [C,H,W]
-            # We'll compute BCE between each GT instance and all predicted logits
-            gt = gt.to(pred.device)
-            bce_losses = []
-            for i in range(N_gt):
-                gt_i = gt[i].unsqueeze(0).expand(C, H, W)  # shape [C,H,W]
-                bce_loss = F.binary_cross_entropy_with_logits(pred, gt_i)
-                bce_losses.append(bce_loss)
+            # -------- pairwise BCE cost matrix ---------------------------------
+            cost = torch.empty((C, N), device=device)
+            for c in range(C):
+                for n in range(N):
+                    cost[c, n] = F.binary_cross_entropy_with_logits(
+                        preds_per_img[c], gts_per_img[n].to(device), reduction="mean"
+                    )
 
-            # Take min loss across GTs for this prediction
-            total_loss += torch.stack(bce_losses).min()
-            valid_samples += 1
+            # Hungarian assignment expects CPU numpy array
+            row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
 
-        # Normalize
-        avg_loss = total_loss / max(valid_samples, 1)
-        return avg_loss
+            matched_losses = cost[row_ind, col_ind]
+            if matched_losses.numel() > 0:
+                total_loss += matched_losses.mean()
+                valid_imgs += 1
+
+        return total_loss / max(valid_imgs, 1)

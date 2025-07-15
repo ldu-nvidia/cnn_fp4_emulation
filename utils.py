@@ -300,7 +300,7 @@ def check_mask(img_idx: int,
 
     # ------------------ save semantic visual --------------------------
     norm = sem_mask.astype(float) / max(1, sem_mask.max())
-    sem_rgb = (cm.nipy_spectral(norm)[..., :3] * 255).astype(np.uint8)
+    sem_rgb = (plt.cm.get_cmap("nipy_spectral")(norm)[..., :3] * 255).astype(np.uint8)
     Image.fromarray(sem_rgb).save(sem_path)
 
     # ------------------ save instance visual --------------------------
@@ -364,17 +364,17 @@ def plot_interactive_3d(tensor, layer_names, stat_names, args, type):
     ))
     fig.write_html(out_path) # or appropriate import
 
-# Fixed palette of distinct colors (R, G, B) for consistent class/instance mapping
-COLOR_PALETTE = [
-    (255, 0, 0),     # red
-    (0, 255, 0),     # green
-    (0, 0, 255),     # blue
-    (255, 255, 0),   # yellow
-    ]
 
 def get_color(index):
-    """Deterministic color assignment based on index"""
-    return COLOR_PALETTE[index % len(COLOR_PALETTE)]
+    # Use a fixed palette of distinguishable colors
+    COLORS = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255),
+        (255, 255, 0), (255, 0, 255), (0, 255, 255),
+        (128, 0, 0), (0, 128, 0), (0, 0, 128),
+        (128, 128, 0), (128, 0, 128), (0, 128, 128),
+        (64, 64, 64), (192, 192, 192)
+    ]
+    return COLORS[index % len(COLORS)]
 
 def save_predictions_for_visualization(model, val_loader, device, task, cat2idx, epoch):
     print("saving predictions for visualization after validation step")
@@ -387,49 +387,55 @@ def save_predictions_for_visualization(model, val_loader, device, task, cat2idx,
             outs = model(imgs)
             preds = outs.argmax(1)
 
-            for i in range(min(len(imgs), 4)):  # save 2 examples
+            for i in range(min(len(imgs), 4)):
                 img = TF.to_pil_image(imgs[i].cpu())
                 img_tensor = TF.to_tensor(img)
 
                 H, W = outs.shape[2:]
+
                 if task == "semantic":
                     gt = parse_segmentation_masks([tgts[i]], H, W, len(cat2idx), cat2idx).argmax(1)[0]
                     pred = preds[i].cpu()
 
-                    # build binary masks per class
                     gt_masks = [(gt == k) for k in gt.unique() if k.item() > 0]
                     pred_masks = [(pred == k) for k in pred.unique() if k.item() > 0]
 
-                    gt_colors = [get_color(k.item()) for k in gt.unique() if k.item() > 0]
-                    pred_colors = [get_color(k.item()) for k in pred.unique() if k.item() > 0]
+                    gt_colors = [get_color(idx) for idx in range(len(gt_masks))]
+                    pred_colors = [get_color(idx) for idx in range(len(pred_masks))]
 
-                    gt_overlay = draw_segmentation_masks(img_tensor.clone(), gt_masks, alpha=0.5, colors=gt_colors)
-                    pred_overlay = draw_segmentation_masks(img_tensor.clone(), pred_masks, alpha=0.5, colors=pred_colors)
+                    gt_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(gt_masks), alpha=0.5, colors=gt_colors)  # type: ignore[arg-type]
+                    pred_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(pred_masks), alpha=0.5, colors=pred_colors)  # type: ignore[arg-type]
 
                 elif task == "instance":
                     masks, _ = parse_instance_masks([tgts[i]], H, W, cat2idx)
-                    masks = masks[0].cpu()
+                    masks = masks[0].cpu()  # shape [N, H, W]
                     pred = preds[i].cpu()
 
                     gt_masks = [m.bool() for m in masks]
-                    pred_masks = [(pred == k) for k in pred.unique() if k.item() > 0]
+                    # Skip background = 0 when visualising predictions
+                    pred_instance_ids = [k for k in pred.unique() if k.item() > 0]
+                    pred_masks = [(pred == k) for k in pred_instance_ids]
 
-                    gt_colors = [get_color(j) for j in range(len(gt_masks))]
-                    pred_colors = [get_color(k.item()) for k in pred.unique() if k.item() > 0]
+                    gt_colors = [get_color(idx) for idx in range(len(gt_masks))]
+                    pred_colors = [get_color(idx) for idx in range(len(pred_masks))]
 
-                    gt_mask_tensor = torch.stack(gt_masks).to(torch.bool)
-                    pred_mask_tensor = torch.stack(pred_masks).to(torch.bool)
+                    if len(gt_masks) > 0:
+                        gt_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(gt_masks), alpha=0.5, colors=gt_colors)  # type: ignore[arg-type]
+                    else:
+                        gt_overlay = img_tensor.clone()
 
-                    gt_overlay = draw_segmentation_masks(img_tensor.clone(), gt_mask_tensor, alpha=0.5, colors=gt_colors)
-                    pred_overlay = draw_segmentation_masks(img_tensor.clone(), pred_mask_tensor, alpha=0.5, colors=pred_colors)
+                    if len(pred_masks) > 0:
+                        pred_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(pred_masks), alpha=0.5, colors=pred_colors)  # type: ignore[arg-type]
+                    else:
+                        pred_overlay = img_tensor.clone()
+
                 else:
                     continue
 
-                # Save side-by-side GT and prediction
-                combined = torch.cat([gt_overlay, pred_overlay], dim=2)  # concat along width
+                combined = torch.cat([gt_overlay, pred_overlay], dim=2)
                 out_img = TF.to_pil_image(combined)
                 out_img.save(f"plots/val_output/epoch{epoch}_sample{i}.png")
-            break  
+            break
 
 def dice_coeff(pred_mask: torch.Tensor, gt_mask: torch.Tensor, eps=1e-6):
     """pred_mask/gt_mask:  [B,H,W] int tensors with class-ids."""

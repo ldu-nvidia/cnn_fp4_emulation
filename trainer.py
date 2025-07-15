@@ -19,6 +19,7 @@ import scipy.stats
 import json
 from data import CocoSegmentationDataset
 from config import configs
+import pickle
 from dataclasses import asdict
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
@@ -33,7 +34,7 @@ from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse
 
 from loss import DiceLoss, instance_loss
 
-SEED =321     # pick any integer you like ────────────────┐
+SEED = 471    # pick any integer you like ────────────────┐
 torch.manual_seed(SEED)       # <- torch CPU ops                │
 random.seed(SEED)             # <- python.random                │
 np.random.seed(SEED)          # <- NumPy                        │
@@ -63,37 +64,47 @@ class reduced_precision_trainer():
         self.scaler = None
         self.ce_loss = None
         self.dice_loss = None
+        # Pre-instantiate instance loss so we don't recreate it every batch
+        self.ins_loss_fn = instance_loss()
 
-    def log_telemetry(self, model, loss_value, step):
+    def log_telemetry(self, loss_value, step):
         if step % self.config.logf != 0:
             return
-        
-        stat_dict_w, stat_dict_grad, stat_dict_a = {}, {}, {}
+
+        stat_dict_w, stat_dict_grad = {}, {}
+
         if not np.isfinite(loss_value):
             print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
             return
+
         wandb.log({"loss": loss_value}, step=step)
-        for name, param in model.named_parameters():
+
+        for name, param in self.model.named_parameters():
             new_name = rename(name)
+
+            # ---- Log Weights ----
             if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
                 w = param.detach().cpu().float().numpy().flatten()
                 if np.isfinite(w).all():
-                    stat_dict_w[new_name + "/mean"] = np.mean(w)
-                    stat_dict_w[new_name + "/std"] = np.std(w)
-                    stat_dict_w[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
-                    wandb.log({new_name: wandb.Histogram(w)}, step=step)
+                    stat_dict_w[f"Weights/{new_name}/mean"] = np.mean(w)
+                    stat_dict_w[f"Weights/{new_name}/std"] = np.std(w)
+                    stat_dict_w[f"Weights/{new_name}/kurtosis"] = scipy.stats.kurtosis(w)
+                    wandb.log({f"Weights/{new_name}/hist": wandb.Histogram(w)}, step=step)
 
+            # ---- Log Gradients ----
             if param.requires_grad and param.grad is not None and 'bias' not in new_name and 'weight' in new_name:
-                w = param.grad.detach().cpu().float().numpy().flatten()
-                if np.isfinite(w).all():
-                    stat_dict_grad[new_name + "/mean"] = np.mean(w)
-                    stat_dict_grad[new_name + "/std"] = np.std(w)
-                    stat_dict_grad[new_name + "/kurtosis"] = scipy.stats.kurtosis(w)
-                    wandb.log({new_name: wandb.Histogram(w)}, step=step)
+                g = param.grad.detach().cpu().float().numpy().flatten()
+                if np.isfinite(g).all():
+                    stat_dict_grad[f"Gradients/{new_name}/mean"] = np.mean(g)
+                    stat_dict_grad[f"Gradients/{new_name}/std"] = np.std(g)
+                    stat_dict_grad[f"Gradients/{new_name}/kurtosis"] = scipy.stats.kurtosis(g)
+                    wandb.log({f"Gradients/{new_name}/hist": wandb.Histogram(g)}, step=step)
 
-        stat_dict_w['step'], stat_dict_grad['step'] = step, step
+        stat_dict_w['step'] = step
+        stat_dict_grad['step'] = step
         self.layer_stats_w.append(stat_dict_w)
         self.layer_stats_grad.append(stat_dict_grad)
+
 
     def save_layer_stats(self):
         output_paths=["weights_layer_stats.json", "grads_layer_stats.json"]
@@ -135,15 +146,41 @@ class reduced_precision_trainer():
         print("\n task finished \n")
 
     def compute_batch_instance_iou(self, pred_mask, gt_mask):
-        pred_mask = (pred_mask > 0).float()
-        gt_mask = (gt_mask > 0).float()
-        intersection = torch.sum((pred_mask == 1) & (gt_mask == 1))
-        union = torch.sum(pred_mask == 1) + torch.sum(gt_mask == 1)
-        return (2.0 * intersection / (union + 1e-6)).item()
+        # Shapes & dtypes
+        assert pred_mask.ndim == 2,  "pred_mask must be H×W"
+        assert gt_mask.ndim  == 3,  "gt_mask  must be N×H×W"
+        assert pred_mask.dtype in (torch.int64, torch.int32, torch.int16, torch.uint8), "pred_mask must be integer type"
+        # Background (0) might legitimately be absent if the model predicted only instances in this image.
+        assert gt_mask.shape[1:] == pred_mask.shape, "spatial dim mismatch"
+
+        ious = []
+
+        for gt in gt_mask:
+            gt_bin = gt.bool()
+            best_iou = 0.0
+
+            # Loop through each unique instance label in prediction (excluding background)
+            for instance_id in pred_mask.unique():
+                if instance_id.item() == 0:
+                    continue  # skip background
+
+                pred_bin = (pred_mask == instance_id)
+                intersection = (gt_bin & pred_bin).sum().item()
+                union = (gt_bin | pred_bin).sum().item()
+                if union > 0:
+                    iou = intersection / union
+                    best_iou = max(best_iou, iou)
+
+            ious.append(best_iou)
+
+        iou_avg = np.mean(ious) if ious else 0.0
+        assert 0.0 <= iou_avg <= 1.0 + 1e-6, "IoU out of [0,1] range"
+        return iou_avg
+
 
     def train_one_epoch(self, train_loader, device, global_step, task, num_cls):
         self.model.train()
-        tr_loss, dice_sum, iou, inst_iou_sum, batches = 0.0, 0.0, 0.0, 0.0, 0
+        tr_loss, dice_sum, inst_iou_sum, batches = 0.0, 0.0, 0.0, 0
         step0 = global_step
         for imgs, tgts in train_loader:
             imgs = imgs.to(device)
@@ -161,36 +198,37 @@ class reduced_precision_trainer():
                 elif task == "instance":
                     masks, _ = parse_instance_masks(tgts, H, W, self.cat2idx)
                     masks = [m.to(device) for m in masks]
-                    ins_loss_fn = instance_loss()
-                    loss = ins_loss_fn(outs, masks)
+                    # Use the pre-built loss function
+                    loss = self.ins_loss_fn(outs, masks)
 
-                    preds = outs.argmax(1)
+                    preds = outs.argmax(1)  # [B,H,W] integer instance IDs
+                    batch_iou = 0.0
                     for p, g in zip(preds, masks):
-                        pred_mask = (p > 0).float()
-                        gt_mask = (g.sum(dim=0) > 0).float()
-                        iou = self.compute_batch_instance_iou(pred_mask, gt_mask)
-                        inst_iou_sum += iou
+                        batch_iou += self.compute_batch_instance_iou(p, g)
+                    batch_iou /= max(len(masks), 1)
+                    inst_iou_sum += batch_iou
+
                 else:
                     loss = torch.zeros([], device=device)
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            global_step += 1
-            if global_step == step0 + 60:
-                break
-            
             tr_loss += loss.item()
+            global_step += 1
             batches += 1
 
-            if self.config.enable_logging and global_step > 0 and global_step % self.config.logf == 0:
-                self.log_telemetry(self.model, loss.item(), global_step)
+            # 🔍 Log intermediate stats every `logf` steps
+            if self.config.enable_logging and global_step % self.config.logf == 0:
+                log_dict = {"train/loss": loss.item()}
+                if task == "semantic":
+                    log_dict["train/dice"] = dice_sum / batches
                 if task == "instance":
-                    wandb.log({"train/instance_iou": iou}, step=global_step)
-                wandb.log({"train/loss": loss.item()}, step=global_step)
+                    log_dict["train/instance_iou"] = inst_iou_sum / batches
+                wandb.log(log_dict, step=global_step)
+                self.log_telemetry(loss.item(), global_step)
 
         avg_dice = dice_sum / max(batches, 1) if task == "semantic" else None
         avg_iou = inst_iou_sum / max(batches, 1) if task == "instance" else None
@@ -200,11 +238,11 @@ class reduced_precision_trainer():
     # ------------------------ Validation --------------------------------
     # ----------------------------------------------------------------------
 
-    def validate(self, model, loader, ce, dice_loss,
+    def validate(self, loader, ce, dice_loss,
                 dev, step0, task, num_cls):
-        model.eval()
+        self.model.eval()
         print("validating")
-        loss   = dice_sum = miou_sum = inst_iou_sum = 0.0
+        total_loss = dice_sum = miou_sum = inst_iou_sum = 0.0
         step    = step0
         batches = 0
 
@@ -212,13 +250,13 @@ class reduced_precision_trainer():
             for imgs, tgts in loader:
                 imgs = imgs.to(dev)
                 with autocast(device_type='cuda', dtype=torch.float16):
-                    outs = model(imgs)                         # [B,C,H,W]
+                    outs = self.model(imgs)                         # [B,C,H,W]
                     H, W = outs.shape[2:]
-
                     if task == "semantic":
                         gt   = parse_segmentation_masks(
                                 tgts, H, W, num_cls, self.cat2idx).to(dev)
-                        loss = combined_loss(outs, gt, ce, dice_loss)
+                        batch_loss = combined_loss(outs, gt, ce, dice_loss)
+                        total_loss += batch_loss.item()
 
                         preds   = outs.argmax(1)               # still on GPU
                         gt_lbl  = gt.argmax(1)
@@ -234,37 +272,26 @@ class reduced_precision_trainer():
                     elif task == "instance":
                         masks, _ = parse_instance_masks(tgts, H, W, self.cat2idx)
                         masks = [m.to(dev) for m in masks]
-                        ins_loss = instance_loss()
-                        loss = ins_loss(outs, masks)
+                        # Use the pre-built loss function
+                        batch_loss = self.ins_loss_fn(outs, masks)
+                        total_loss += batch_loss.item()
 
-                        preds = outs.argmax(1)  # [B,H,W], still on GPU
+                        preds = outs.argmax(1)  # [B,H,W] integer instance IDs
+                        batch_iou = 0.0
                         for p, g in zip(preds, masks):
-                            # Ensure g is on the same device as preds
-                            g = g.to(p.device)
-
-                            # Merge all instance masks into one binary mask
-                            pred_mask = (p > 0).float()
-                            gt_mask = (g.sum(dim=0) > 0).float()
-
-                            # Optional: print unique values for debug
-                            #print(f"[val] pred unique: {p.unique()}, gt merged unique: {gt_mask.unique()}")
-
-                            # Compute IoU between binary masks
-                            intersection = torch.sum((pred_mask == 1) & (gt_mask == 1))
-                            union        = torch.sum(pred_mask == 1) + torch.sum(gt_mask == 1)
-                            batch_iou = (2.0 * intersection / (union + 1e-6)).item()
-                            inst_iou_sum += batch_iou
-                            #print(f"[val] batch instance IoU: {batch_iou:.4f}")
-                            batches += 1
+                            batch_iou += self.compute_batch_instance_iou(p, g)
+                        batch_iou /= max(len(masks), 1)
+                        inst_iou_sum += batch_iou
+                        batches += 1
                     else:   # detection
                         gt   = parse_detection_heatmap(tgts, H, W).to(dev)
-                        loss = torch.zeros([], device=dev)
+                        batch_loss = torch.zeros([], device=dev)
+                        total_loss += batch_loss.item()
 
-                loss += loss.item()
                 step  += 1
 
         # ---- average metrics -----------------------------------------------
-        loss   /= max(batches, 1)
+        loss   = total_loss / max(batches, 1)
         dice_av = dice_sum   / max(batches, 1)
         miou_av = miou_sum   / max(batches, 1)
         inst_av = inst_iou_sum / max(batches, 1)
@@ -280,17 +307,29 @@ class reduced_precision_trainer():
 
     # ---------------------------- run() ---------------------------------
     def run(self):
-        print("start initial mask check");  check_mask(int(SEED))
-
+        if os.path.exists("plots/"):
+            shutil.rmtree("plots/")
+        
+        # Set device FIRST
+        device = torch.device("cuda:1")
+        #print("start initial mask check");  check_mask(int(SEED))
         if self.config.enable_logging:
-            wandb.init(project="unet-fp16-coco",
+            wandb.init(project=self.config.project_name,
                        name=self.config.wandb_name,
                        config=asdict(self.config))
 
-        device = torch.device("cuda:1")
-        coco = get_coco(self.config.ann_file)
-        cat_ids = sorted(coco.getCatIds())
-        self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
+        cache_path = "cat2idx_cache.pkl"
+        if os.path.exists(cache_path):
+            print("Loading cached cat2idx dictionary...")
+            with open(cache_path, "rb") as f:
+                self.cat2idx = pickle.load(f)
+        else:
+            print("Computing and caching cat2idx dictionary...")
+            coco = get_coco(self.config.ann_file)
+            cat_ids = sorted(coco.getCatIds())
+            self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
+            with open(cache_path, "wb") as f:
+                pickle.dump(self.cat2idx, f)
 
         dataset = CocoSegmentationDataset(
             img_root=self.config.coco_root,
@@ -328,18 +367,26 @@ class reduced_precision_trainer():
         self.dice_loss = DiceLoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(),
                                           lr=self.config.lr, weight_decay=1e-5)
-        self.scaler = GradScaler(device='cuda')
+        self.scaler = GradScaler(device="cuda")
 
         global_step = 0
         for epoch in range(self.config.epochs):
             print(f"\nEpoch {epoch}")
             tr_loss, tr_dice, tr_iou, global_step = self.train_one_epoch(train_loader, device, global_step, self.config.task, num_cls)
 
-            vl_loss, global_step = self.validate(self.model, val_loader, self.ce_loss, self.dice_loss, device, global_step, self.config.task, num_cls)
-            print("per epoch loss: ", tr_loss, " per epoch dice: ", tr_dice, " per epoch iou: ", tr_iou, " per epoch val loss: ", vl_loss)
+            vl_loss, global_step = self.validate(val_loader, self.ce_loss, self.dice_loss, device, global_step, self.config.task, num_cls)
+            
+            ## print per epoch stats
+            def fmt(v): return f"{v:.5f}" if v is not None else "-"
 
+            print(f"per epoch loss: {fmt(tr_loss)}  "
+                f"per epoch dice: {fmt(tr_dice)}  "
+                f"per epoch iou: {fmt(tr_iou)}  "
+                f"per epoch val loss: {fmt(vl_loss)}")
+                
             print("saving predictions for visualization after validation step")
             save_predictions_for_visualization(self.model, val_loader, device, self.config.task, self.cat2idx, epoch)
-            
-        torch.save(self.model.state_dict(), "unet_final.pth")
+
+        os.makedirs("checkpoints/", exist_ok=True)
+        torch.save(self.model.state_dict(), "checkpoints/unet_final.pth")
         self.finalize_and_visualize()
