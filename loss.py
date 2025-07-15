@@ -69,13 +69,26 @@ class instance_loss(nn.Module):
                 valid_imgs += 1
                 continue
 
-            # -------- pairwise BCE cost matrix ---------------------------------
+            # -------- pairwise BCE cost matrix (vectorised) --------------------
+            # Flatten spatial dims to P = H*W for memory-efficient ops
+            preds_flat = preds_per_img.view(C, -1)          # [C, P]
+            gts_flat   = gts_per_img.to(device).view(N, -1) # [N, P]
+
             cost = torch.empty((C, N), device=device)
-            for c in range(C):
+            # Loop over the smaller dimension to keep memory low
+            if N <= C:
+                # iterate over GT masks (typically fewer)
                 for n in range(N):
-                    cost[c, n] = F.binary_cross_entropy_with_logits(
-                        preds_per_img[c], gts_per_img[n].to(device), reduction="mean"
-                    )
+                    tgt = gts_flat[n].unsqueeze(0).expand(C, -1)  # [C,P]
+                    cost[:, n] = F.binary_cross_entropy_with_logits(
+                        preds_flat, tgt, reduction="none"
+                    ).mean(dim=1)
+            else:
+                for c in range(C):
+                    pred_row = preds_flat[c].unsqueeze(0).expand(N, -1)  # [N,P]
+                    cost[c] = F.binary_cross_entropy_with_logits(
+                        pred_row, gts_flat, reduction="none"
+                    ).mean(dim=1)
 
             # Hungarian assignment expects CPU numpy array
             row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())

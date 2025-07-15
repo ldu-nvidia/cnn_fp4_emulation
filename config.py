@@ -13,10 +13,10 @@ class TrainingConfig:
     batch_size: int = 16
     lr: float = 5e-5
     epochs: int = 5
-    task: str = "instance" 
+    task: str = "semantic" 
 
-    wandb_name: str = "2 epochs full run" # choices: semantic, instance, detection
-    project_name: str = "instance segmentation full precision"
+    wandb_name: str = "ground truth mask fix" # choices: semantic, instance, detection
+    project_name: str = "semantic segmentation full precision"
 
     # Logging parameters
     logf: int = 10
@@ -25,7 +25,6 @@ class TrainingConfig:
     log_grads: bool = True
     visualize_val: bool = True
     seeds: int = 226
-    
     # Debug parameters
     debug: bool = True
     

@@ -27,7 +27,7 @@ from torchmetrics.functional import jaccard_index
 from models.baseline import UNetFP16 
 import shutil
 from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
-    coco_collate_fn, count_parameters, get_max_category_id, combined_loss, visualize_instance_batch, \
+    coco_collate_fn, count_parameters, combined_loss, visualize_instance_batch, \
     get_max_instances_from_annotations, log_visual_predictions_to_file, check_mask, save_visual_predictions, \
         get_coco, get_max_instances_from_annotations, plot_grid_heatmaps, plot_interactive_3d, dice_coeff, \
             save_predictions_for_visualization, miou, instance_iou)
@@ -42,7 +42,6 @@ torch.cuda.manual_seed(SEED)  # <- torch GPU ops (optional)     │
 torch.backends.cudnn.deterministic = True   # reproducible conv │
 torch.backends.cudnn.benchmark = False      # (may slow a bit)  │
 # ───────────────────────────────────────────────────────────────┘
-
 # 1.  torch.Generator to control the *shuffling* RNG
 g = torch.Generator()
 g.manual_seed(SEED)
@@ -105,7 +104,6 @@ class reduced_precision_trainer():
         self.layer_stats_w.append(stat_dict_w)
         self.layer_stats_grad.append(stat_dict_grad)
 
-
     def save_layer_stats(self):
         output_paths=["weights_layer_stats.json", "grads_layer_stats.json"]
         directory = "plots/heatmaps/"
@@ -147,8 +145,8 @@ class reduced_precision_trainer():
 
     def compute_batch_instance_iou(self, pred_mask, gt_mask):
         # Shapes & dtypes
-        assert pred_mask.ndim == 2,  "pred_mask must be H×W"
-        assert gt_mask.ndim  == 3,  "gt_mask  must be N×H×W"
+        assert pred_mask.ndim == 2,  "pred_mask must be HxW"
+        assert gt_mask.ndim  == 3,  "gt_mask  must be NxHxW"
         assert pred_mask.dtype in (torch.int64, torch.int32, torch.int16, torch.uint8), "pred_mask must be integer type"
         # Background (0) might legitimately be absent if the model predicted only instances in this image.
         assert gt_mask.shape[1:] == pred_mask.shape, "spatial dim mismatch"
@@ -218,6 +216,9 @@ class reduced_precision_trainer():
 
             tr_loss += loss.item()
             global_step += 1
+
+            if global_step == step0 + 50:
+                break
             batches += 1
 
             # 🔍 Log intermediate stats every `logf` steps
@@ -233,7 +234,6 @@ class reduced_precision_trainer():
         avg_dice = dice_sum / max(batches, 1) if task == "semantic" else None
         avg_iou = inst_iou_sum / max(batches, 1) if task == "instance" else None
         return tr_loss / max(batches, 1), avg_dice, avg_iou, global_step
-
 
     # ------------------------ Validation --------------------------------
     # ----------------------------------------------------------------------
@@ -287,8 +287,7 @@ class reduced_precision_trainer():
                         gt   = parse_detection_heatmap(tgts, H, W).to(dev)
                         batch_loss = torch.zeros([], device=dev)
                         total_loss += batch_loss.item()
-
-                step  += 1
+                step += 1
 
         # ---- average metrics -----------------------------------------------
         loss   = total_loss / max(batches, 1)
@@ -303,7 +302,6 @@ class reduced_precision_trainer():
                 wandb.log({"val/instance_iou": inst_av}, step=step)
             wandb.log({"val/loss": loss}, step = step)
         return loss, step
-
 
     # ---------------------------- run() ---------------------------------
     def run(self):

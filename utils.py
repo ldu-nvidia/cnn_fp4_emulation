@@ -78,19 +78,34 @@ def parse_segmentation_masks(targets, height, width, num_classes, category_id_to
     for anns in targets:
         mask = torch.zeros((num_classes, height, width), dtype=torch.float32)
         for ann in anns:
-            if 'segmentation' in ann and ann['segmentation']:
-                coco_cat_id = ann['category_id']
-                if coco_cat_id not in category_id_to_class_idx:
-                    continue
-                class_idx = category_id_to_class_idx[coco_cat_id]
-                rle = coco_mask.frPyObjects(ann['segmentation'], height, width)
-                decoded = coco_mask.decode(rle)
-                if decoded.ndim == 3:
-                    decoded = np.any(decoded, axis=2)
-                m_tensor = torch.from_numpy(decoded.astype(np.float32))
-                m_tensor = TF.resize(m_tensor.unsqueeze(0), size=[height, width], interpolation=TF.InterpolationMode.NEAREST)
-                m_tensor = m_tensor.squeeze(0)
-                mask[class_idx] = torch.max(mask[class_idx], m_tensor)
+            if not ann.get("segmentation"):
+                continue
+
+            coco_cat_id = ann["category_id"]
+            if coco_cat_id not in category_id_to_class_idx:
+                continue
+
+            class_idx = category_id_to_class_idx[coco_cat_id]
+
+            # --- decode at ORIGINAL resolution ------------------------------
+            H0, W0 = ann.get("orig_height"), ann.get("orig_width")
+            if H0 is None or W0 is None:
+                raise KeyError("orig_height / orig_width not found in annotation; make sure data.py attaches them.")
+
+            rle = coco_mask.frPyObjects(ann["segmentation"], H0, W0)
+            decoded = coco_mask.decode(rle)
+            if decoded.ndim == 3:                    # merge polygon parts
+                decoded = np.any(decoded, axis=2)
+
+            m_tensor = torch.from_numpy(decoded.astype(np.float32))
+            # --- resize to training resolution --------------------------------
+            m_tensor = TF.resize(
+                m_tensor.unsqueeze(0),
+                size=[height, width],
+                interpolation=TF.InterpolationMode.NEAREST,
+            ).squeeze(0)
+
+            mask[class_idx] = torch.max(mask[class_idx], m_tensor)
         batch_masks.append(mask)
     return torch.stack(batch_masks)
 
@@ -403,8 +418,15 @@ def save_predictions_for_visualization(model, val_loader, device, task, cat2idx,
                     gt_colors = [get_color(idx) for idx in range(len(gt_masks))]
                     pred_colors = [get_color(idx) for idx in range(len(pred_masks))]
 
-                    gt_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(gt_masks), alpha=0.5, colors=gt_colors)  # type: ignore[arg-type]
-                    pred_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(pred_masks), alpha=0.5, colors=pred_colors)  # type: ignore[arg-type]
+                    if len(gt_masks) > 0:
+                        gt_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(gt_masks), alpha=0.5, colors=gt_colors)  # type: ignore[arg-type]
+                    else:
+                        gt_overlay = img_tensor.clone()
+
+                    if len(pred_masks) > 0:
+                        pred_overlay = draw_segmentation_masks(img_tensor.clone(), torch.stack(pred_masks), alpha=0.5, colors=pred_colors)  # type: ignore[arg-type]
+                    else:
+                        pred_overlay = img_tensor.clone()
 
                 elif task == "instance":
                     masks, _ = parse_instance_masks([tgts[i]], H, W, cat2idx)
@@ -438,10 +460,32 @@ def save_predictions_for_visualization(model, val_loader, device, task, cat2idx,
             break
 
 def dice_coeff(pred_mask: torch.Tensor, gt_mask: torch.Tensor, eps=1e-6):
-    """pred_mask/gt_mask:  [B,H,W] int tensors with class-ids."""
-    intersection = torch.sum((pred_mask == gt_mask) & (gt_mask > 0))
-    union        = torch.sum(gt_mask > 0) + torch.sum(pred_mask > 0)
-    return (2.0 * intersection + eps) / (union + eps)
+    """Mean Dice over classes present in *ground-truth* (ignores background).
+
+    Args
+    -----
+    pred_mask : [B,H,W] integer tensor – model predictions (argmax).
+    gt_mask   : [B,H,W] integer tensor – ground-truth class indices.
+    """
+    assert pred_mask.shape == gt_mask.shape, "pred/gt shapes must match"
+
+    classes = torch.unique(gt_mask)
+    dice_sum = 0.0
+    valid_cls = 0
+    for cls in classes:
+        # skip background id if you store one (assume -1 or 255). If none, keep.
+        if cls.item() < 0:
+            continue
+        pred_c = (pred_mask == cls)
+        gt_c   = (gt_mask  == cls)
+        if gt_c.sum() == 0 and pred_c.sum() == 0:
+            continue
+        inter = (pred_c & gt_c).sum()
+        union = pred_c.sum() + gt_c.sum()
+        dice_sum += (2 * inter) / (union + eps)
+        valid_cls += 1
+
+    return dice_sum / max(valid_cls, 1)
 
 
 def miou(pred_mask: torch.Tensor, gt_mask: torch.Tensor, num_classes: int):
