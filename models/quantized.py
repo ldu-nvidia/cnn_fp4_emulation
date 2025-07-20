@@ -17,30 +17,46 @@ def quantize_activations_hook(module, input, output):
         return quantized_output
     return output
 
+# --- Gradient hook ----
+def get_gradient_hook(quantizer):
+    """Return a hook that quantizes gradients during backward pass."""
+
+    def _hook(grad):
+        return quantizer(grad)
+
+    return _hook
+
 # --- UNet Blocks ---
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    """Same conv–GroupNorm–ReLU stack used in baseline UNetFP16."""
+
+    def __init__(self, in_channels: int, out_channels: int, groups: int = 8):
         super().__init__()
-        self.seq = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, out_channels),
+            nn.ReLU(inplace=False),
         )
 
     def forward(self, x):
-        return self.seq(x)
+        return self.block(x)
 
 # --- Quantized UNet Model ---
 class QuantizedUNetDeep(nn.Module):
-    def __init__(self, in_ch=3, out_ch=1, exp_bits=2, man_bits=1):
+    """Quantized version of UNetFP16 with identical topology (scaled channels)."""
+
+    def __init__(self, in_ch: int = 3, out_ch: int = 1, exp_bits: int = 2, man_bits: int = 1):
         super().__init__()
+
         self.exp_bits = exp_bits
         self.man_bits = man_bits
-
         wl = self.exp_bits + self.man_bits + 1  # sign + exponent + mantissa bits
+
+        # Channel scaling identical to baseline (0.25)
+        self.scale = 0.25
 
         self.act_quantizer = Quantizer(
             forward_number=BlockFloatingPoint(wl=wl),
@@ -58,30 +74,41 @@ class QuantizedUNetDeep(nn.Module):
             forward_rounding="stochastic"
         )
 
-        # Encoder
-        self.enc1 = ConvBlock(in_ch, 64)
+        s = self.scale
+
+        def ch(x: int) -> int:
+            return int(s * x)
+
+        # Encoder -------------------------------------------------------
+        self.enc1 = ConvBlock(in_ch,  ch(64))
         self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = ConvBlock(64, 128)
+
+        self.enc2 = ConvBlock(ch(64),  ch(128))
         self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = ConvBlock(128, 256)
+
+        self.enc3 = ConvBlock(ch(128), ch(256))
         self.pool3 = nn.MaxPool2d(2)
-        self.enc4 = ConvBlock(256, 512)
+
+        self.enc4 = ConvBlock(ch(256), ch(512))
         self.pool4 = nn.MaxPool2d(2)
 
-        # Bottleneck
-        self.bottleneck = ConvBlock(512, 1024)
+        # Bottleneck ----------------------------------------------------
+        self.bottleneck = ConvBlock(ch(512), ch(1024))
 
-        # Decoder
-        self.up4 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
-        self.dec4 = ConvBlock(1024, 512)
-        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
-        self.dec3 = ConvBlock(512, 256)
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
-        self.dec2 = ConvBlock(256, 128)
-        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.dec1 = ConvBlock(128, 64)
+        # Decoder -------------------------------------------------------
+        self.up4 = nn.ConvTranspose2d(ch(1024), ch(512), 2, stride=2)
+        self.dec4 = ConvBlock(ch(1024),  ch(512))
 
-        self.final = nn.Conv2d(64, out_ch, 1)
+        self.up3 = nn.ConvTranspose2d(ch(512),  ch(256), 2, stride=2)
+        self.dec3 = ConvBlock(ch(512),  ch(256))
+
+        self.up2 = nn.ConvTranspose2d(ch(256),  ch(128), 2, stride=2)
+        self.dec2 = ConvBlock(ch(256),  ch(128))
+
+        self.up1 = nn.ConvTranspose2d(ch(128),  ch(64), 2, stride=2)
+        self.dec1 = ConvBlock(ch(128),  ch(64))
+
+        self.final = nn.Conv2d(ch(64), out_ch, 1)
 
         # Register quantization hooks
         for module in self.modules():
@@ -90,6 +117,11 @@ class QuantizedUNetDeep(nn.Module):
                 module.act_quantizer = self.act_quantizer
                 module.register_forward_pre_hook(quantize_weights_hook)
                 module.register_forward_hook(quantize_activations_hook)
+
+        # Register gradient hooks on all learnable parameters
+        for param in self.parameters():
+            if param.requires_grad:
+                param.register_hook(get_gradient_hook(self.grad_quantizer))
 
     def forward(self, x):
         x1 = self.enc1(x)

@@ -216,9 +216,6 @@ class reduced_precision_trainer():
 
             tr_loss += loss.item()
             global_step += 1
-
-            if global_step == step0 + 50:
-                break
             batches += 1
 
             # 🔍 Log intermediate stats every `logf` steps
@@ -236,8 +233,6 @@ class reduced_precision_trainer():
         return tr_loss / max(batches, 1), avg_dice, avg_iou, global_step
 
     # ------------------------ Validation --------------------------------
-    # ----------------------------------------------------------------------
-
     def validate(self, loader, ce, dice_loss,
                 dev, step0, task, num_cls):
         self.model.eval()
@@ -386,5 +381,5 @@ class reduced_precision_trainer():
             save_predictions_for_visualization(self.model, val_loader, device, self.config.task, self.cat2idx, epoch)
 
         os.makedirs("checkpoints/", exist_ok=True)
-        torch.save(self.model.state_dict(), "checkpoints/unet_final.pth")
+        torch.save(self.model.state_dict(), "checkpoints/" + self.config.project_name + "_" + self.config.wandb_name + "_unet_final.pth")
         self.finalize_and_visualize()

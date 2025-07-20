@@ -24,39 +24,43 @@ class UNetFP16(nn.Module):
         super().__init__()
         self.scale = 0.25
 
-        # channel size double
-        self.enc1 = ConvBlock(in_channels, int(self.scale*64))
+        # convenience: apply scaling factor exactly as in quantized model
+        def ch(x: int) -> int:  # local helper
+            return int(self.scale * x)
+
+        # Encoder --------------------------------------------------------
+        self.enc1 = ConvBlock(in_channels, ch(64))
         self.pool1 = nn.MaxPool2d(2)
 
-        self.enc2 = ConvBlock(int(self.scale*64), int(self.scale*128))
+        self.enc2 = ConvBlock(ch(64), ch(128))
         self.pool2 = nn.MaxPool2d(2)
 
-        self.enc3 = ConvBlock(int(self.scale*128), int(self.scale*256))
+        self.enc3 = ConvBlock(ch(128), ch(256))
         self.pool3 = nn.MaxPool2d(2)
 
-        self.enc4 = ConvBlock(int(self.scale*256), int(self.scale*512))
+        self.enc4 = ConvBlock(ch(256), ch(512))
         self.pool4 = nn.MaxPool2d(2)
 
-        self.bottleneck = ConvBlock(int(self.scale*512), int(self.scale*1024))
+        self.bottleneck = ConvBlock(ch(512), ch(1024))
 
-        self.upconv4 = nn.ConvTranspose2d(int(self.scale*1024), int(self.scale*512), kernel_size=2, stride=2)
-        self.dec4 = ConvBlock(int(self.scale*1024), int(self.scale*512))
+        self.upconv4 = nn.ConvTranspose2d(ch(1024), ch(512), kernel_size=2, stride=2)
+        self.dec4 = ConvBlock(ch(1024), ch(512))
 
-        self.upconv3 = nn.ConvTranspose2d(int(self.scale*512), int(self.scale*256), kernel_size=2, stride=2)
-        self.dec3 = ConvBlock(int(self.scale*512), int(self.scale*256))
+        self.upconv3 = nn.ConvTranspose2d(ch(512), ch(256), kernel_size=2, stride=2)
+        self.dec3 = ConvBlock(ch(512), ch(256))
 
-        self.upconv2 = nn.ConvTranspose2d(int(self.scale*256), int(self.scale*128), kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(int(self.scale*256), int(self.scale*128))
+        self.upconv2 = nn.ConvTranspose2d(ch(256), ch(128), kernel_size=2, stride=2)
+        self.dec2 = ConvBlock(ch(256), ch(128))
 
-        self.upconv1 = nn.ConvTranspose2d(int(self.scale*128), int(self.scale*64), kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(int(self.scale*128), int(self.scale*64))
+        self.upconv1 = nn.ConvTranspose2d(ch(128), ch(64), kernel_size=2, stride=2)
+        self.dec1 = ConvBlock(ch(128), ch(64))
 
         if task == "semantic":
             assert out_channels != -1, "out_channels must be specified for semantic task"
-            self.out_conv = nn.Conv2d(int(self.scale*64), out_channels, kernel_size=1)
+            self.out_conv = nn.Conv2d(ch(64), out_channels, kernel_size=1)
         elif task == "instance":
             assert num_instances != -1, "num_instances must be specified for instance task"
-            self.out_conv = nn.Conv2d(int(self.scale*64), num_instances, kernel_size=1)
+            self.out_conv = nn.Conv2d(ch(64), num_instances, kernel_size=1)
         else:
             raise ValueError("Unsupported task type")
 
