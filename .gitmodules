@@ -1,0 +1,3 @@
+[submodule "models/brevitas"]
+	path = models/brevitas
+	url = https://github.com/ldu-nvidia/brevitas.git
