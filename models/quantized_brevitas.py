@@ -11,6 +11,41 @@ from brevitas.quant.fixed_point import (
 )
 from brevitas.quant.fixed_point import Int4WeightPerTensorFixedPointDecoupled as Int4WeightPerTensorFixedPoint
 from brevitas.inject.enum import QuantType
+from brevitas.quant.experimental.float_base import (
+    Fp4WeightPerTensorFloat,      # wrappers you added
+    Fp4ActPerTensorFloat,
+)
+
+# ------------------------------------------------------------------
+# Gradient quantisation to FP4 via a straight-through estimator
+# ------------------------------------------------------------------
+
+def _float_to_fp4(t: torch.Tensor) -> torch.Tensor:
+    """Pack FP32 tensor into uint8 nibble representing e2m1 (sign|exp|man)."""
+    s = (t < 0).to(torch.uint8)
+    t = t.abs().clamp(min=2 ** -2, max=2 ** 1.5)
+    exp = torch.floor(torch.log2(t) + 1e-30) + 1  # bias 1
+    man = ((t / (2 ** exp)) - 1.0).round()
+    fp4 = (s << 3) | ((exp.to(torch.uint8) & 0x3) << 1) | man.to(torch.uint8)
+    return fp4
+
+
+def _fp4_to_float(fp4: torch.Tensor) -> torch.Tensor:
+    s = (fp4 >> 3) & 0x1
+    exp = ((fp4 >> 1) & 0x3).to(torch.int8) - 1
+    man = (fp4 & 0x1).to(torch.float32)
+    val = (1.0 + man) * torch.pow(2.0, exp.float())
+    return torch.where(s.bool(), -val, val)
+
+
+class _FP4GradSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, g):
+        return _fp4_to_float(_float_to_fp4(g))
+
+    @staticmethod
+    def backward(ctx, gg):
+        return gg  # straight-through
 
 
 # Brevitas ships only weight FP4 quantizers; define a thin activation wrapper

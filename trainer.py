@@ -34,7 +34,13 @@ from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse
 
 from loss import DiceLoss, instance_loss
 
-SEED = 471    # pick any integer you like ────────────────┐
+# Optional: FP4 histograms if using quantized_brevitas model
+try:
+    from models.quantized_brevitas import _float_to_fp4  # type: ignore
+except ImportError:
+    _float_to_fp4 = None
+
+SEED = 911    # pick any integer you like ────────────────┐
 torch.manual_seed(SEED)       # <- torch CPU ops                │
 random.seed(SEED)             # <- python.random                │
 np.random.seed(SEED)          # <- NumPy                        │
@@ -89,6 +95,9 @@ class reduced_precision_trainer():
                     stat_dict_w[f"Weights/{new_name}/std"] = np.std(w)
                     stat_dict_w[f"Weights/{new_name}/kurtosis"] = scipy.stats.kurtosis(w)
                     wandb.log({f"Weights/{new_name}/hist": wandb.Histogram(w)}, step=step)
+                    if _float_to_fp4 is not None:
+                        fp4_vals = _float_to_fp4(param).cpu().view(-1)
+                        wandb.log({f"WeightsFP4/{new_name}/hist": wandb.Histogram(fp4_vals)}, step=step)
 
             # ---- Log Gradients ----
             if param.requires_grad and param.grad is not None and 'bias' not in new_name and 'weight' in new_name:
@@ -98,6 +107,9 @@ class reduced_precision_trainer():
                     stat_dict_grad[f"Gradients/{new_name}/std"] = np.std(g)
                     stat_dict_grad[f"Gradients/{new_name}/kurtosis"] = scipy.stats.kurtosis(g)
                     wandb.log({f"Gradients/{new_name}/hist": wandb.Histogram(g)}, step=step)
+                    if _float_to_fp4 is not None:
+                        fp4g = _float_to_fp4(param.grad).cpu().view(-1)
+                        wandb.log({f"GradientsFP4/{new_name}/hist": wandb.Histogram(fp4g)}, step=step)
 
         stat_dict_w['step'] = step
         stat_dict_grad['step'] = step

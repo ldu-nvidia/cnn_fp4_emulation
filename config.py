@@ -6,7 +6,7 @@ from dataclasses import dataclass
 class TrainingConfig:
     """Configuration class for training parameters."""
     # Data parameters
-    coco_root: str = "coco2017/images/train2017"
+    coco_root: str = "coco2017/train2017"
     ann_file: str = "coco2017/annotations/instances_train2017.json"
     
     # Training parameters
@@ -15,7 +15,7 @@ class TrainingConfig:
     epochs: int = 5
     task: str = "semantic" 
 
-    wandb_name: str = "5_epochs_full_run" 
+    wandb_name: str = "5_epochs_full_run_2" 
     project_name: str = "semantic_segmentation_full_precision"
 
     # Logging parameters
@@ -24,7 +24,7 @@ class TrainingConfig:
     log_weights: bool = True
     log_grads: bool = True
     visualize_val: bool = True
-    seeds: int = 927
+    seeds: int = 892
     # Debug parameters
     debug: bool = True
     
