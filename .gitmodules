@@ -2,3 +2,9 @@
 	path = kitchen
 	url = https://gitlab-master.nvidia.com/compute/chef/kitchen
 	ignore = all
+[submodule "QPytorch"]
+	path = QPytorch
+	url = https://github.com/ldu-nvidia/QPyTorch.git
+[submodule "brevitas"]
+	path = brevitas
+	url = https://github.com/ldu-nvidia/brevitas.git
