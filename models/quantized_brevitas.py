@@ -1,20 +1,24 @@
+import sys, pathlib
+sys.path.append(str(pathlib.Path(__file__).parent / "brevitas" / "src"))
 import torch
 import torch.nn as nn
 from typing import List, Optional
+import brevitas
 
-try:
-    from brevitas.nn import (
-        QuantConv2d,
-        QuantConvTranspose2d,
-        QuantIdentity,
-    )
-    from brevitas.quant import (
-        Int4WeightPerTensorFixedPoint,
-        Int4ActPerTensorFixedPoint,
-        QuantType,
-    )
-except ImportError as e:
-    raise ImportError("Brevitas is required for quantized_brevitas model. Install via `pip install brevitas`." ) from e
+from brevitas.nn import QuantConv2d, QuantConvTranspose2d, QuantIdentity
+from brevitas.quant.fixed_point import (
+    Int8ActPerTensorFixedPoint,
+)
+from brevitas.quant.fixed_point import Int4WeightPerTensorFixedPointDecoupled as Int4WeightPerTensorFixedPoint
+from brevitas.inject.enum import QuantType
+
+
+# Brevitas ships only weight FP4 quantizers; define a thin activation wrapper
+
+class Int4ActPerTensorFixedPoint(Int8ActPerTensorFixedPoint):
+    """4-bit activation quantizer based on the Int8 fixed-point implementation."""
+
+    bit_width = 4
 
 
 class ConvBlock(nn.Module):
@@ -42,10 +46,10 @@ class ConvBlock(nn.Module):
         ) if quant else nn.Identity()
 
         self.block = nn.Sequential(
-            Conv(in_ch, out_ch, kernel_size=3, padding=1, **w_qkwargs),
+            Conv(in_ch, out_ch, kernel_size=3, padding=1, **w_qkwargs),  # type: ignore[arg-type]
             nn.GroupNorm(groups, out_ch),
             nn.ReLU(inplace=False),
-            Conv(out_ch, out_ch, kernel_size=3, padding=1, **w_qkwargs),
+            Conv(out_ch, out_ch, kernel_size=3, padding=1, **w_qkwargs),  # type: ignore[arg-type]
             nn.GroupNorm(groups, out_ch),
             nn.ReLU(inplace=False),
             a_q,
@@ -133,11 +137,15 @@ class QuantUNetFP4(nn.Module):
             if q("final")
             else nn.Conv2d
         )
-        w_kwargs = dict(
-            weight_bit_width=4,
-            weight_quant=Int4WeightPerTensorFixedPoint,
-            quant_type=QuantType.INT,
-        ) if q("final") else {}
+        w_kwargs = (
+            dict(
+                weight_bit_width=4,
+                weight_quant=Int4WeightPerTensorFixedPoint,
+                quant_type=QuantType.INT,
+            )
+            if q("final")
+            else {}
+        )
 
         if task == "semantic":
             assert out_channels != -1
