@@ -15,8 +15,11 @@ class TrainingConfig:
     epochs: int = 5
     task: str = "semantic" 
 
-    wandb_name: str = "5_epochs_full_run_2" 
-    project_name: str = "semantic_segmentation_full_precision"
+    wandb_name: str = "test low precision" 
+    project_name: str = "semantic_segmentation"
+
+    # Model parameters
+    model: str = "fp16"  # choices: fp16, nvfp4
 
     # Logging parameters
     logf: int = 10
@@ -39,6 +42,11 @@ class TrainingConfig:
         if self.lr <= 0:
             raise ValueError(f"Learning rate must be positive, got: {self.lr}")
 
+        # Validate model choice here to fail fast. Keep list in sync with model_factory.
+        valid_models = ["fp16", "nvfp4"]
+        if self.model not in valid_models:
+            raise ValueError(f"Invalid model: {self.model}. Must be one of: {', '.join(valid_models)}")
+
 def parse_args() -> TrainingConfig:
     """Parse command line arguments and return a TrainingConfig object."""
     parser = argparse.ArgumentParser(description="Training configuration for CNN FP4 emulation")
@@ -58,6 +66,12 @@ def parse_args() -> TrainingConfig:
     parser.add_argument('--task', type=str, 
                        choices=['semantic', 'instance', 'detection'], 
                        default=TrainingConfig.task)
+
+    # Model parameters
+    parser.add_argument('--model', type=str,
+                        choices=['nvfp4'],
+                        default=TrainingConfig.model,
+                        help='Which UNet backbone to use')
     
     # Logging parameters
     parser.add_argument('--logf', type=int, default=TrainingConfig.logf)
@@ -85,7 +99,8 @@ def parse_args() -> TrainingConfig:
         log_weights=args.log_weights,
         log_grads=args.log_grads,
         visualize_val=args.visualize_val,
-        debug=args.debug
+        debug=args.debug,
+        model=args.model
     )
 
 # For backward compatibility

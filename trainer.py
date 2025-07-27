@@ -24,7 +24,8 @@ from dataclasses import asdict
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torchmetrics.functional import jaccard_index
-from models.baseline import UNetFP16 
+from importlib import import_module
+
 import shutil
 from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse_detection_heatmap, \
     coco_collate_fn, count_parameters, combined_loss, visualize_instance_batch, \
@@ -52,6 +53,24 @@ torch.backends.cudnn.benchmark = False      # (may slow a bit)  │
 g = torch.Generator()
 g.manual_seed(SEED)
 
+# Model factory mapping
+MODEL_REGISTRY = {
+    "fp16": ("models.full_precision", "UNetFP16"),
+    "nvfp4": ("models.quantized_kitchen_autograd", "UNetNVFP4"),
+}
+
+def get_model_class(model_key: str):
+    if model_key not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model key '{model_key}'. Available: {list(MODEL_REGISTRY.keys())}")
+    module_name, class_name = MODEL_REGISTRY[model_key]
+    try:
+        module = import_module(module_name)
+    except ImportError as e:
+        raise ImportError(f"Failed to import module '{module_name}' for model '{model_key}': {e}")
+    if not hasattr(module, class_name):
+        raise AttributeError(f"Module '{module_name}' does not have class '{class_name}'")
+    return getattr(module, class_name)
+
 # 2. worker_init_fn so *each* worker gets a deterministic, unique seed
 def seed_worker(worker_id: int):
     # base_seed is the same for every worker but worker_id makes it unique
@@ -59,7 +78,7 @@ def seed_worker(worker_id: int):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
-class reduced_precision_trainer():
+class trainer():
     def __init__(self, config):
         self.layer_stats_w = []
         self.layer_stats_grad = []
@@ -364,7 +383,9 @@ class reduced_precision_trainer():
             num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
             generator=g, worker_init_fn=seed_worker)
 
-        self.model = UNetFP16(task=self.config.task, in_channels=3,
+        # Create model based on config
+        ModelCls = get_model_class(self.config.model)
+        self.model = ModelCls(task=self.config.task, in_channels=3,
                               out_channels=num_cls, num_instances=num_inst).to(device)
         count_parameters(self.model)
 

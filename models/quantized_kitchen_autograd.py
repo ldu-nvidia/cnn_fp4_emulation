@@ -41,8 +41,9 @@ class AutoQuantConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Quantise activation and weight; returns FP tensors with quant error + STE
-        qx = self.qop.quantize(x, self.qparams_x, return_identity=True, return_transpose=False).data
-        qw = self.qop.quantize(self.conv.weight, self.qparams_w, return_identity=True, return_transpose=False).data
+        # Keep tensors attached to the graph so gradients flow through the quantizer's STE
+        qx = self.qop.quantize(x, self.qparams_x, return_identity=True, return_transpose=False)
+        qw = self.qop.quantize(self.conv.weight, self.qparams_w, return_identity=True, return_transpose=False)
         return nn.functional.conv2d(qx, qw, bias=None, stride=self.conv.stride,
                                      padding=self.conv.padding, dilation=self.conv.dilation,
                                      groups=self.conv.groups)
@@ -71,8 +72,8 @@ class AutoQuantConvTranspose2d(nn.Module):
         )
 
     def forward(self, x):
-        qx = self.qop.quantize(x, self.qparams_x, return_identity=True).data
-        qw = self.qop.quantize(self.tconv.weight, self.qparams_w, return_identity=True).data
+        qx = self.qop.quantize(x, self.qparams_x, return_identity=True)
+        qw = self.qop.quantize(self.tconv.weight, self.qparams_w, return_identity=True)
         return nn.functional.conv_transpose2d(qx, qw, bias=None, stride=2)
 
 
