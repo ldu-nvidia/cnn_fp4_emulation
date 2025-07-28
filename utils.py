@@ -68,7 +68,11 @@ def rename(old_name):
     if 'block' in old_name:
         splitted = old_name.split('.')
         layer, blk_num, type = splitted[0], splitted[-2], splitted[-1]
-        new_name = layer + "." + block_to_layer_dict[blk_num]+ "." + type
+        if blk_num in block_to_layer_dict:
+            new_name = f"{layer}.{block_to_layer_dict[blk_num]}.{type}"
+        else:
+            # Unknown block identifier; fall back to original name
+            new_name = old_name
     else:
         new_name = old_name
     return new_name
@@ -342,11 +346,15 @@ def get_max_category_id(ann_file):
     coco = get_coco(ann_file)
     return max(coco.getCatIds())
 
-def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
+def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type, model_key=""):
     os.makedirs("plots/heatmaps/", exist_ok=True)
-    out_path = "plots/heatmaps/" + args.task + "_" + type + ".png"
+    suffix = f"_{model_key}" if model_key else ""
+    out_path = f"plots/heatmaps/{args.task}_{type}{suffix}.png"
     steps = tensor.shape[0]
     fig, axs = plt.subplots(len(stat_names), 1, figsize=(15, 10 * len(stat_names)), squeeze=False)
+    if model_key:
+        fig.suptitle(f"Model: {model_key}", fontsize=34, y=0.97)
+        plt.subplots_adjust(top=0.9)
     # Add a dedicated title on every subplot (mean, std, kurtosis)
     singular_type = type[:-1] if type.endswith('s') else type  # e.g., weights ➜ weight
     for i, stat in enumerate(stat_names):
@@ -357,21 +365,24 @@ def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type):
         ax.set_yticks(list(range(len(layer_names))))
         layer_names = [name.replace("weight", "") if "weight" in name else name for name in layer_names]
         ax.set_yticklabels(layer_names)
-        plt.xlabel("Every "+ str(args.logf) +" Steps")
+        plt.xlabel("Every "+ str(args.logf) +" Steps", fontsize=20)
+        # per-ax label removed to avoid redundancy
         fig.colorbar(im, ax=ax)
     plt.savefig(out_path)
     plt.close()
 
-def plot_interactive_3d(tensor, layer_names, stat_names, args, type):
+def plot_interactive_3d(tensor, layer_names, stat_names, args, type, model_key=""):
     os.makedirs("plots/heatmaps/", exist_ok=True)
-    out_path="plots/heatmaps/" + args.task + "_" + type + ".html"
+    suffix = f"_{model_key}" if model_key else ""
+    out_path = f"plots/heatmaps/{args.task}_{type}{suffix}.html"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     steps, layers, stats = tensor.shape
     fig = go.Figure()
     for i in range(stats):
         z = tensor[:, :, i].T
         fig.add_trace(go.Surface(z=z, name=stat_names[i]))
-    fig.update_layout(title="Layer Stats 3D", scene=dict(
+    title_txt = "Layer Stats 3D" + (f" - {model_key}" if model_key else "")
+    fig.update_layout(title=title_txt, scene=dict(
         xaxis_title="Step",
         yaxis_title="Layer",
         zaxis_title="Stat Value",
@@ -391,7 +402,7 @@ def get_color(index):
     ]
     return COLORS[index % len(COLORS)]
 
-def save_predictions_for_visualization(model, val_loader, device, task, cat2idx, epoch):
+def save_predictions_for_visualization(model, val_loader, device, task, cat2idx, epoch, model_key=""):
     print("saving predictions for visualization after validation step")
     model.eval()
     os.makedirs("plots/val_output", exist_ok=True)
@@ -456,7 +467,9 @@ def save_predictions_for_visualization(model, val_loader, device, task, cat2idx,
 
                 combined = torch.cat([gt_overlay, pred_overlay], dim=2)
                 out_img = TF.to_pil_image(combined)
-                out_img.save(f"plots/val_output/epoch{epoch}_sample{i}.png")
+                suffix = f"_{model_key}" if model_key else ""
+                out_path = f"plots/val_output/epoch{epoch}_img{i}{suffix}.png"
+                out_img.save(out_path)
             break
 
 def dice_coeff(pred_mask: torch.Tensor, gt_mask: torch.Tensor, eps=1e-6):

@@ -20,9 +20,9 @@ class ConvBlock(nn.Module):
 
 # UNet model with GroupNorm and AMP-safe layers
 class UNetFP16(nn.Module):
-    def __init__(self, task, in_channels=3, out_channels=80, num_instances=10):
+    def __init__(self, task: str, in_channels=3, out_channels=80, num_instances=10, scale_factor: float = 0.25):
         super().__init__()
-        self.scale = 0.25
+        self.scale = scale_factor
 
         # convenience: apply scaling factor exactly as in quantized model
         def ch(x: int) -> int:  # local helper

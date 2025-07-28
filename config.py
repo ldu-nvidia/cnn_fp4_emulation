@@ -1,6 +1,11 @@
 import argparse
-from typing import Optional
+from typing import Optional, List
 from dataclasses import dataclass
+import os
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # keeps numbering stable
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"        # hide others *before* torch import
+
+import torch
 
 @dataclass
 class TrainingConfig:
@@ -10,16 +15,16 @@ class TrainingConfig:
     ann_file: str = "coco2017/annotations/instances_train2017.json"
     
     # Training parameters
-    batch_size: int = 16
+    batch_size: int = 32
     lr: float = 5e-5
-    epochs: int = 5
+    epochs: int = 2
     task: str = "semantic" 
 
-    wandb_name: str = "test low precision" 
-    project_name: str = "semantic_segmentation"
+    wandb_name: str = "1st full run" 
+    project_name: str = "semantic_segmentation_full_vs_quantized"
 
     # Model parameters
-    model: str = "fp16"  # choices: fp16, nvfp4
+    models: List[str] = ("nvfp4", "fp16")  # list of model keys to train sequentially
 
     # Logging parameters
     logf: int = 10
@@ -27,7 +32,10 @@ class TrainingConfig:
     log_weights: bool = True
     log_grads: bool = True
     visualize_val: bool = True
-    seeds: int = 892
+    seeds: int = 715
+
+    # Architecture parameter
+    model_scale_factor: float = 0.25  # scales base channel counts
     # Debug parameters
     debug: bool = True
     
@@ -42,10 +50,14 @@ class TrainingConfig:
         if self.lr <= 0:
             raise ValueError(f"Learning rate must be positive, got: {self.lr}")
 
-        # Validate model choice here to fail fast. Keep list in sync with model_factory.
+        if self.model_scale_factor <= 0 or self.model_scale_factor > 1:
+            raise ValueError("model_scale_factor must be in (0,1].")
+
+        # Validate model choices here to fail fast.
         valid_models = ["fp16", "nvfp4"]
-        if self.model not in valid_models:
-            raise ValueError(f"Invalid model: {self.model}. Must be one of: {', '.join(valid_models)}")
+        for m in self.models:
+            if m not in valid_models:
+                raise ValueError(f"Invalid model: {m}. Must be one of: {', '.join(valid_models)}")
 
 def parse_args() -> TrainingConfig:
     """Parse command line arguments and return a TrainingConfig object."""
@@ -67,11 +79,11 @@ def parse_args() -> TrainingConfig:
                        choices=['semantic', 'instance', 'detection'], 
                        default=TrainingConfig.task)
 
-    # Model parameters
-    parser.add_argument('--model', type=str,
-                        choices=['nvfp4'],
-                        default=TrainingConfig.model,
-                        help='Which UNet backbone to use')
+    # Model parameters (accept multiple)
+    parser.add_argument('--models', type=str, nargs='+',
+                        choices=['nvfp4', 'fp16'],
+                        default=list(TrainingConfig.models),
+                        help='List of UNet backbones to train sequentially')
     
     # Logging parameters
     parser.add_argument('--logf', type=int, default=TrainingConfig.logf)
@@ -80,6 +92,9 @@ def parse_args() -> TrainingConfig:
     parser.add_argument('--log_grads', action='store_true', default=TrainingConfig.log_grads)
     parser.add_argument('--visualize_val', action='store_true', default=TrainingConfig.visualize_val)
 
+    # Model architecture scale
+    parser.add_argument('--model_scale_factor', type=float, default=TrainingConfig.model_scale_factor,
+                        help='Multiply base channel counts by this factor (0<sf<=1).')
     
     # Debug parameters
     parser.add_argument('--debug', action='store_true', default=TrainingConfig.debug,
@@ -100,7 +115,8 @@ def parse_args() -> TrainingConfig:
         log_grads=args.log_grads,
         visualize_val=args.visualize_val,
         debug=args.debug,
-        model=args.model
+        models=args.models,
+        model_scale_factor=args.model_scale_factor
     )
 
 # For backward compatibility

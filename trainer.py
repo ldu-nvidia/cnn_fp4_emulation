@@ -136,7 +136,8 @@ class trainer():
         self.layer_stats_grad.append(stat_dict_grad)
 
     def save_layer_stats(self):
-        output_paths=["weights_layer_stats.json", "grads_layer_stats.json"]
+        suffix = f"_{getattr(self, 'current_model_key', '')}" if getattr(self, 'current_model_key', '') else ""
+        output_paths=[f"weights_layer_stats{suffix}.json", f"grads_layer_stats{suffix}.json"]
         directory = "plots/heatmaps/"
         os.makedirs(directory, exist_ok=True)
         for outpath, layer_stats in zip(output_paths, [self.layer_stats_w, self.layer_stats_grad]):
@@ -169,8 +170,8 @@ class trainer():
                     if k == 'step': continue
                     base, stat = k.rsplit('/', 1)
                     tensor[i, layer_names.index(base), stat_map[stat]] = v
-            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type)
-            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type)
+            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type, self.current_model_key)
+            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type, self.current_model_key)
             print("✅ Plots saved to plot folder")
         print("\n task finished \n")
 
@@ -333,86 +334,103 @@ class trainer():
     def run(self):
         if os.path.exists("plots/"):
             shutil.rmtree("plots/")
-        
-        # Set device FIRST
-        device = torch.device("cuda:1")
-        #print("start initial mask check");  check_mask(int(SEED))
-        if self.config.enable_logging:
-            wandb.init(project=self.config.project_name,
-                       name=self.config.wandb_name,
-                       config=asdict(self.config))
 
-        cache_path = "cat2idx_cache.pkl"
-        if os.path.exists(cache_path):
-            print("Loading cached cat2idx dictionary...")
-            with open(cache_path, "rb") as f:
-                self.cat2idx = pickle.load(f)
-        else:
-            print("Computing and caching cat2idx dictionary...")
-            coco = get_coco(self.config.ann_file)
-            cat_ids = sorted(coco.getCatIds())
-            self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
-            with open(cache_path, "wb") as f:
-                pickle.dump(self.cat2idx, f)
+        gpu_index = 0
+        device = torch.device(f"cuda:{gpu_index}")
+        torch.cuda.set_device(gpu_index)
 
-        dataset = CocoSegmentationDataset(
-            img_root=self.config.coco_root,
-            ann_file=self.config.ann_file,
-            category_id_to_class_idx=self.cat2idx,
-            target_size=(256, 256))
+        # Loop through each requested model configuration
+        for model_key in self.config.models:
+            print(f"\n================ Training model: {model_key} ================\n")
 
-        if self.config.task == "semantic":
-            num_cls, num_inst = len(self.cat2idx), -1
-        elif self.config.task == "instance":
-            num_inst = get_max_instances_from_annotations(self.config.ann_file)
-            num_cls  = len(self.cat2idx)
-            print(f"Max instances / image = {num_inst}")
-        else:
-            raise ValueError("Unsupported task type")
+            # fresh telemetry buffers per model
+            self.layer_stats_w.clear()
+            self.layer_stats_grad.clear()
 
-        val_frac = 0.0005
-        val_len = int(val_frac * len(dataset))
-        train_len = len(dataset) - val_len
-        train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=g)
+            # Initialise W&B run per model if logging enabled
+            if self.config.enable_logging:
+                wandb.init(project=self.config.project_name,
+                           name=f"{self.config.wandb_name}_{model_key}",
+                           config={**asdict(self.config), "model": model_key},
+                           reinit=True)  # new run each loop
 
-        train_loader = DataLoader(train_set, batch_size=self.config.batch_size, shuffle=True,
-            num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
-            generator=g, worker_init_fn=seed_worker)
+            # dataset and loaders constructed only once outside loop (reuse) ----------------
+            if not hasattr(self, "_data_prepared"):
+                cache_path = "cat2idx_cache.pkl"
+                if os.path.exists(cache_path):
+                    print("Loading cached cat2idx dictionary...")
+                    with open(cache_path, "rb") as f:
+                        self.cat2idx = pickle.load(f)
+                else:
+                    print("Computing and caching cat2idx dictionary...")
+                    coco = get_coco(self.config.ann_file)
+                    cat_ids = sorted(coco.getCatIds())
+                    self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
+                    with open(cache_path, "wb") as f:
+                        pickle.dump(self.cat2idx, f)
 
-        val_loader = DataLoader(val_set, batch_size=self.config.batch_size, shuffle=False,
-            num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
-            generator=g, worker_init_fn=seed_worker)
+                dataset = CocoSegmentationDataset(
+                    img_root=self.config.coco_root,
+                    ann_file=self.config.ann_file,
+                    category_id_to_class_idx=self.cat2idx,
+                    target_size=(256, 256))
 
-        # Create model based on config
-        ModelCls = get_model_class(self.config.model)
-        self.model = ModelCls(task=self.config.task, in_channels=3,
-                              out_channels=num_cls, num_instances=num_inst).to(device)
-        count_parameters(self.model)
+                if self.config.task == "semantic":
+                    num_cls, num_inst = len(self.cat2idx), -1
+                elif self.config.task == "instance":
+                    num_inst = get_max_instances_from_annotations(self.config.ann_file)
+                    num_cls = len(self.cat2idx)
+                    print(f"Max instances / image = {num_inst}")
+                else:
+                    raise ValueError("Unsupported task type")
 
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.dice_loss = DiceLoss()
-        self.optimizer = torch.optim.Adam(self.model.parameters(),
-                                          lr=self.config.lr, weight_decay=1e-5)
-        self.scaler = GradScaler(device="cuda")
+                val_frac = 0.001
+                val_len = int(val_frac * len(dataset))
+                train_len = len(dataset) - val_len
+                train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=g)
 
-        global_step = 0
-        for epoch in range(self.config.epochs):
-            print(f"\nEpoch {epoch}")
-            tr_loss, tr_dice, tr_iou, global_step = self.train_one_epoch(train_loader, device, global_step, self.config.task, num_cls)
+                self.train_loader = DataLoader(train_set, batch_size=self.config.batch_size, shuffle=True,
+                    num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
+                    generator=g, worker_init_fn=seed_worker)
 
-            vl_loss, global_step = self.validate(val_loader, self.ce_loss, self.dice_loss, device, global_step, self.config.task, num_cls)
-            
-            ## print per epoch stats
-            def fmt(v): return f"{v:.5f}" if v is not None else "-"
+                self.val_loader = DataLoader(val_set, batch_size=self.config.batch_size, shuffle=False,
+                    num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
+                    generator=g, worker_init_fn=seed_worker)
 
-            print(f"per epoch loss: {fmt(tr_loss)}  "
-                f"per epoch dice: {fmt(tr_dice)}  "
-                f"per epoch iou: {fmt(tr_iou)}  "
-                f"per epoch val loss: {fmt(vl_loss)}")
-                
-            print("saving predictions for visualization after validation step")
-            save_predictions_for_visualization(self.model, val_loader, device, self.config.task, self.cat2idx, epoch)
+                self._data_prepared = True  # flag
 
-        os.makedirs("checkpoints/", exist_ok=True)
-        torch.save(self.model.state_dict(), "checkpoints/" + self.config.project_name + "_" + self.config.wandb_name + "_unet_final.pth")
-        self.finalize_and_visualize()
+            # Build model -----------------------------------------------------
+            ModelCls = get_model_class(model_key)
+            self.model = ModelCls(task=self.config.task, in_channels=3,
+                                  out_channels=num_cls, num_instances=num_inst,
+                                  scale_factor=self.config.model_scale_factor).to(device)
+            count_parameters(self.model)
+
+            # fresh optimizer & scaler
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.lr, weight_decay=1e-5)
+            self.scaler = GradScaler(device="cuda")
+
+            self.ce_loss = nn.CrossEntropyLoss()
+            self.dice_loss = DiceLoss()
+
+            global_step = 0
+            for epoch in range(self.config.epochs):
+                print(f"\nEpoch {epoch} ({model_key})")
+                tr_loss, tr_dice, tr_iou, global_step = self.train_one_epoch(self.train_loader, device, global_step, self.config.task, num_cls)
+                #vl_loss, global_step = self.validate(self.val_loader, self.ce_loss, self.dice_loss, device, global_step, self.config.task, num_cls)
+
+                def fmt(v): return f"{v:.5f}" if v is not None else "-"
+                #print(f"[{model_key}] epoch loss: {fmt(tr_loss)}  dice: {fmt(tr_dice)}  iou: {fmt(tr_iou)}  val loss: {fmt(vl_loss)}")
+
+                save_predictions_for_visualization(self.model, self.val_loader, device, self.config.task, self.cat2idx, epoch, model_key)
+
+            os.makedirs("checkpoints/", exist_ok=True)
+            ckpt_path = f"checkpoints/{self.config.project_name}_{self.config.wandb_name}_{model_key}_unet_final.pth"
+            torch.save(self.model.state_dict(), ckpt_path)
+            self.current_model_key = model_key
+            self.finalize_and_visualize()
+
+            if self.config.enable_logging:
+                wandb.finish()
+
+        print("\nAll requested models have finished training.\n")

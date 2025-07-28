@@ -15,6 +15,31 @@ from kitchen.quantization import ScalingType, TensorType
 from kitchen import utils as k_utils
 
 
+def _quantize_with_padding(qop: QuantOp, tensor: torch.Tensor, qparams: QParams, block: int = 16) -> torch.Tensor:
+    """Quantize `tensor` in blocks of `block`, padding with zeros if needed.
+
+    The Kitchen quantizer reshapes the last dimension to `block`, so the total
+    number of elements must be divisible by `block`. For convolution weights
+    (e.g., 3x3 kernels) this is often not the case. We therefore flatten the
+    tensor, pad with zeros, quantize, then remove the padding and reshape back
+    to the original shape so the subsequent convolution receives a tensor of
+    identical shape and dtype.
+    """
+
+    original_shape = tensor.shape
+    flat = tensor.reshape(-1)
+    pad_len = (block - (flat.numel() % block)) % block
+    if pad_len:
+        flat = torch.cat([flat, torch.zeros(pad_len, device=flat.device, dtype=flat.dtype)])
+
+    flat = flat.view(-1, block)
+    q_flat = qop.quantize(flat, qparams)
+    q_flat = q_flat.view(-1)
+    if pad_len:
+        q_flat = q_flat[:-pad_len]
+    return q_flat.view(original_shape)
+
+
 class AutoQuantConv2d(nn.Module):
     """Conv2d that fake-quantises weight and input using Kitchen autograd NVFP4."""
 
@@ -42,8 +67,8 @@ class AutoQuantConv2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Quantise activation and weight; returns FP tensors with quant error + STE
         # Keep tensors attached to the graph so gradients flow through the quantizer's STE
-        qx = self.qop.quantize(x, self.qparams_x, return_identity=True, return_transpose=False)
-        qw = self.qop.quantize(self.conv.weight, self.qparams_w, return_identity=True, return_transpose=False)
+        qx = self.qop.quantize(x, self.qparams_x)
+        qw = _quantize_with_padding(self.qop, self.conv.weight, self.qparams_w)
         return nn.functional.conv2d(qx, qw, bias=None, stride=self.conv.stride,
                                      padding=self.conv.padding, dilation=self.conv.dilation,
                                      groups=self.conv.groups)
@@ -72,8 +97,8 @@ class AutoQuantConvTranspose2d(nn.Module):
         )
 
     def forward(self, x):
-        qx = self.qop.quantize(x, self.qparams_x, return_identity=True)
-        qw = self.qop.quantize(self.tconv.weight, self.qparams_w, return_identity=True)
+        qx = self.qop.quantize(x, self.qparams_x)
+        qw = _quantize_with_padding(self.qop, self.tconv.weight, self.qparams_w)
         return nn.functional.conv_transpose2d(qx, qw, bias=None, stride=2)
 
 
@@ -96,9 +121,9 @@ class ConvBlock(nn.Module):
 class UNetNVFP4(nn.Module):
     """UNet with NVFP4 fake-quant (all conv layers except GroupNorm and out)."""
 
-    def __init__(self, task: str, in_channels=3, out_channels=80, num_instances=10):
+    def __init__(self, task: str, in_channels=3, out_channels=80, num_instances=10, scale_factor: float = 0.25):
         super().__init__()
-        self.scale = 0.25
+        self.scale = scale_factor
         ch = lambda v: int(self.scale * v)
 
         # Encoder
