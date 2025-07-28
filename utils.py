@@ -346,17 +346,24 @@ def get_max_category_id(ann_file):
     coco = get_coco(ann_file)
     return max(coco.getCatIds())
 
-def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type, model_key=""):
+def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type_label, model_key="", subfolder=""):
     os.makedirs("plots/heatmaps/", exist_ok=True)
-    suffix = f"_{model_key}" if model_key else ""
-    out_path = f"plots/heatmaps/{args.task}_{type}{suffix}.png"
+    # determine nested directory: weights/<subfolder> or gradients
+    base = f"plots/heatmaps/{model_key}"
+    if subfolder:
+        base = os.path.join(base, "weights", subfolder)
+    else:
+        base = os.path.join(base, "gradients")
+    os.makedirs(base, exist_ok=True)
+    signal = "gradients" if "grad" in type_label else "weights"
+    out_path = f"{base}/{args.task}_{signal}.png"
     steps = tensor.shape[0]
     fig, axs = plt.subplots(len(stat_names), 1, figsize=(15, 10 * len(stat_names)), squeeze=False)
     if model_key:
         fig.suptitle(f"Model: {model_key}", fontsize=34, y=0.97)
         plt.subplots_adjust(top=0.9)
     # Add a dedicated title on every subplot (mean, std, kurtosis)
-    singular_type = type[:-1] if type.endswith('s') else type  # e.g., weights ➜ weight
+    singular_type = type_label[:-1] if type_label.endswith('s') else type_label  # e.g., weights ➜ weight
     for i, stat in enumerate(stat_names):
         ax = axs[i, 0]
         ax.set_title(f"{singular_type.capitalize()} Stats: {stat}", fontsize=30)
@@ -371,11 +378,15 @@ def plot_grid_heatmaps(tensor, layer_names, stat_names, args, type, model_key=""
     plt.savefig(out_path)
     plt.close()
 
-def plot_interactive_3d(tensor, layer_names, stat_names, args, type, model_key=""):
-    os.makedirs("plots/heatmaps/", exist_ok=True)
-    suffix = f"_{model_key}" if model_key else ""
-    out_path = f"plots/heatmaps/{args.task}_{type}{suffix}.html"
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+def plot_interactive_3d(tensor, layer_names, stat_names, args, type_label, model_key="", subfolder=""):
+    base = f"plots/heatmaps/{model_key}"
+    if subfolder:
+        base = os.path.join(base, "weights", subfolder)
+    else:
+        base = os.path.join(base, "gradients")
+    os.makedirs(base, exist_ok=True)
+    signal = "gradients" if "grad" in type_label else "weights"
+    out_path = f"{base}/{args.task}_{signal}.html"
     steps, layers, stats = tensor.shape
     fig = go.Figure()
     for i in range(stats):

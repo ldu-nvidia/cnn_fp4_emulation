@@ -35,12 +35,6 @@ from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse
 
 from loss import DiceLoss, instance_loss
 
-# Optional: FP4 histograms if using quantized_brevitas model
-try:
-    from models.quantized_brevitas import _float_to_fp4  # type: ignore
-except ImportError:
-    _float_to_fp4 = None
-
 SEED = 911    # pick any integer you like ────────────────┐
 torch.manual_seed(SEED)       # <- torch CPU ops                │
 random.seed(SEED)             # <- python.random                │
@@ -80,7 +74,9 @@ def seed_worker(worker_id: int):
 
 class trainer():
     def __init__(self, config):
-        self.layer_stats_w = []
+        self.layer_stats_w_raw = []
+        self.layer_stats_w_q = []
+        self.layer_stats_w_deq = []
         self.layer_stats_grad = []
         self.config = config
         self.model = None
@@ -95,7 +91,7 @@ class trainer():
         if step % self.config.logf != 0:
             return
 
-        stat_dict_w, stat_dict_grad = {}, {}
+        stat_dict_raw, stat_dict_q, stat_dict_deq, stat_dict_grad = {}, {}, {}, {}
 
         if not np.isfinite(loss_value):
             print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
@@ -108,15 +104,12 @@ class trainer():
 
             # ---- Log Weights ----
             if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
-                w = param.detach().cpu().float().numpy().flatten()
-                if np.isfinite(w).all():
-                    stat_dict_w[f"Weights/{new_name}/mean"] = np.mean(w)
-                    stat_dict_w[f"Weights/{new_name}/std"] = np.std(w)
-                    stat_dict_w[f"Weights/{new_name}/kurtosis"] = scipy.stats.kurtosis(w)
-                    wandb.log({f"Weights/{new_name}/hist": wandb.Histogram(w)}, step=step)
-                    if _float_to_fp4 is not None:
-                        fp4_vals = _float_to_fp4(param).cpu().view(-1)
-                        wandb.log({f"WeightsFP4/{new_name}/hist": wandb.Histogram(fp4_vals)}, step=step)
+                w_fp = param.detach().cpu().float().numpy().flatten()
+                if np.isfinite(w_fp).all():
+                    stat_dict_raw[f"Weights/{new_name}/mean"] = np.mean(w_fp)
+                    stat_dict_raw[f"Weights/{new_name}/std"] = np.std(w_fp)
+                    stat_dict_raw[f"Weights/{new_name}/kurtosis"] = scipy.stats.kurtosis(w_fp)
+                    wandb.log({f"Weights/{new_name}/hist": wandb.Histogram(w_fp)}, step=step)
 
             # ---- Log Gradients ----
             if param.requires_grad and param.grad is not None and 'bias' not in new_name and 'weight' in new_name:
@@ -126,36 +119,52 @@ class trainer():
                     stat_dict_grad[f"Gradients/{new_name}/std"] = np.std(g)
                     stat_dict_grad[f"Gradients/{new_name}/kurtosis"] = scipy.stats.kurtosis(g)
                     wandb.log({f"Gradients/{new_name}/hist": wandb.Histogram(g)}, step=step)
-                    if _float_to_fp4 is not None:
-                        fp4g = _float_to_fp4(param.grad).cpu().view(-1)
-                        wandb.log({f"GradientsFP4/{new_name}/hist": wandb.Histogram(fp4g)}, step=step)
 
-        stat_dict_w['step'] = step
+        stat_dict_raw['step'] = step
+        stat_dict_q['step'] = step
+        stat_dict_deq['step'] = step
         stat_dict_grad['step'] = step
-        self.layer_stats_w.append(stat_dict_w)
+        self.layer_stats_w_raw.append(stat_dict_raw)
+        self.layer_stats_w_q.append(stat_dict_q)
+        self.layer_stats_w_deq.append(stat_dict_deq)
         self.layer_stats_grad.append(stat_dict_grad)
 
     def save_layer_stats(self):
-        suffix = f"_{getattr(self, 'current_model_key', '')}" if getattr(self, 'current_model_key', '') else ""
-        output_paths=[f"weights_layer_stats{suffix}.json", f"grads_layer_stats{suffix}.json"]
-        directory = "plots/heatmaps/"
-        os.makedirs(directory, exist_ok=True)
-        for outpath, layer_stats in zip(output_paths, [self.layer_stats_w, self.layer_stats_grad]):
-            with open(directory + outpath, "w") as f:
+        model_key = getattr(self, 'current_model_key', 'model')
+        base_dir = f"plots/heatmaps/{model_key}"
+        mapping = [
+            ("weights/prequantize", self.layer_stats_w_raw, "semantic_weights.json"),
+            ("weights/quantized",   self.layer_stats_w_q,   "semantic_weights.json"),
+            ("weights/dequantized", self.layer_stats_w_deq, "semantic_weights.json"),
+            ("gradients",           self.layer_stats_grad,  "semantic_gradients.json"),
+        ]
+
+        for sub, layer_stats, fname in mapping:
+            out_dir = os.path.join(base_dir, sub)
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, fname)
+            with open(out_path, "w") as f:
                 serializable_stats = [
                     {k: float(v) if hasattr(v, 'item') and hasattr(v, 'dtype') else v for k, v in entry.items()}
                     for entry in layer_stats
                 ]
                 json.dump(serializable_stats, f)
-                assert outpath in os.listdir(directory)
-        print("✅ Layer stats saved to plot folder")
+        print("✅ Layer stats saved to plot folder structure under", base_dir)
 
     def finalize_and_visualize(self):
         print("\n finalizing and visualizing \n")
-        assert len(self.layer_stats_w) != 0 and len(self.layer_stats_grad) != 0, "weight or grad stats are empty"
+        assert len(self.layer_stats_w_raw) != 0 and len(self.layer_stats_grad) != 0, "weight or grad stats are empty"
         print("saving layer stats")
         self.save_layer_stats()
-        for layer_stats, type in zip([self.layer_stats_w, self.layer_stats_grad], ['weights', 'grads']):
+        type_list = ['weights_prequant', 'weights_quantized', 'weights_dequant', 'grads']
+        subfolder_map = {
+            'weights_prequant': 'prequantize',
+            'weights_quantized': 'quantized',
+            'weights_dequant': 'dequantized',
+            'grads': ''  # empty triggers gradients folder path
+        }
+
+        for layer_stats, type in zip([self.layer_stats_w_raw, self.layer_stats_w_q, self.layer_stats_w_deq, self.layer_stats_grad], type_list):
             keys = sorted(k for k in layer_stats[0].keys() if k != 'step')
             steps = [stat['step'] for stat in layer_stats]
             tensor = np.zeros((len(steps), len(keys) // 3, 3))
@@ -170,8 +179,9 @@ class trainer():
                     if k == 'step': continue
                     base, stat = k.rsplit('/', 1)
                     tensor[i, layer_names.index(base), stat_map[stat]] = v
-            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type, self.current_model_key)
-            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type, self.current_model_key)
+            subfolder = subfolder_map[type]
+            plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type_label=type, model_key=self.current_model_key, subfolder=subfolder)
+            plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type_label=type, model_key=self.current_model_key, subfolder=subfolder)
             print("✅ Plots saved to plot folder")
         print("\n task finished \n")
 
@@ -259,7 +269,8 @@ class trainer():
                     log_dict["train/instance_iou"] = inst_iou_sum / batches
                 wandb.log(log_dict, step=global_step)
                 self.log_telemetry(loss.item(), global_step)
-
+            if global_step == step0 + 50:
+                break
         avg_dice = dice_sum / max(batches, 1) if task == "semantic" else None
         avg_iou = inst_iou_sum / max(batches, 1) if task == "instance" else None
         return tr_loss / max(batches, 1), avg_dice, avg_iou, global_step
@@ -344,7 +355,9 @@ class trainer():
             print(f"\n================ Training model: {model_key} ================\n")
 
             # fresh telemetry buffers per model
-            self.layer_stats_w.clear()
+            self.layer_stats_w_raw.clear()
+            self.layer_stats_w_q.clear()
+            self.layer_stats_w_deq.clear()
             self.layer_stats_grad.clear()
 
             # Initialise W&B run per model if logging enabled
