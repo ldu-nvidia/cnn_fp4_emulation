@@ -17,6 +17,7 @@ from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 import scipy.stats
 import json
+from kitchen.quantization_autograd import quantize as kitchen_quantize
 from data import CocoSegmentationDataset
 from config import configs
 import pickle
@@ -119,6 +120,56 @@ class trainer():
                     stat_dict_grad[f"Gradients/{new_name}/std"] = np.std(g)
                     stat_dict_grad[f"Gradients/{new_name}/kurtosis"] = scipy.stats.kurtosis(g)
                     wandb.log({f"Gradients/{new_name}/hist": wandb.Histogram(g)}, step=step)
+
+            # ---- Log Quantized Weights ----
+            modules_dict = dict(self.model.named_modules())
+            mod_prefix = name.rsplit('.', 1)[0]
+            # Walk up the hierarchy until a module with qparams_w is found
+            parts = mod_prefix.split('.')
+            module = None
+            while parts:
+                candidate = '.'.join(parts)
+                m = modules_dict.get(candidate, None)
+                if m is not None and hasattr(m, 'qparams_w'):
+                    module = m
+                    break
+                parts.pop()
+
+            if module is not None:
+                try:
+                    # Quantized int codes and scale from kitchen quantize
+                    qparams = module.qparams_w
+                    block = qparams.quant_tile_shape[1]
+                    flat = param.detach().view(-1)
+                    pad_len = (block - (flat.numel() % block)) % block
+                    if pad_len:
+                        flat = torch.cat([flat, torch.zeros(pad_len, device=flat.device, dtype=flat.dtype)])
+                    flat = flat.view(-1, block)
+                    q_int, sx, _ = kitchen_quantize(flat, qparams, reduction_dim=-1)
+                    q_int = q_int.view(-1)
+                    if pad_len:
+                        q_int = q_int[:-pad_len]
+                        sx = sx.view(-1).repeat_interleave(block)[:-pad_len]
+                    else:
+                        sx = sx.view(-1).repeat_interleave(block)
+
+                    # stats for quantized ints
+                    w_q = q_int.cpu().float().numpy()
+                    if np.isfinite(w_q).all():
+                        stat_dict_q[f"Weights_q/{new_name}/mean"] = np.mean(w_q)
+                        stat_dict_q[f"Weights_q/{new_name}/std"] = np.std(w_q)
+                        stat_dict_q[f"Weights_q/{new_name}/kurtosis"] = scipy.stats.kurtosis(w_q)
+                        wandb.log({f"Weights_q_int/{new_name}/hist": wandb.Histogram(w_q)}, step=step)
+
+                    # dequantized values
+                    deq = (q_int.float() * sx).cpu().numpy()
+                    if np.isfinite(deq).all():
+                        stat_dict_deq[f"Weights_deq/{new_name}/mean"] = np.mean(deq)
+                        stat_dict_deq[f"Weights_deq/{new_name}/std"] = np.std(deq)
+                        stat_dict_deq[f"Weights_deq/{new_name}/kurtosis"] = scipy.stats.kurtosis(deq)
+                        wandb.log({f"Weights_deq/{new_name}/hist": wandb.Histogram(deq)}, step=step)
+                except Exception as e:
+                    print(f"[telemetry] dequant logging failed for {new_name}: {e}")
 
         stat_dict_raw['step'] = step
         stat_dict_q['step'] = step
