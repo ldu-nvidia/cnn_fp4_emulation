@@ -79,6 +79,7 @@ class trainer():
         self.layer_stats_w_q = []
         self.layer_stats_w_deq = []
         self.layer_stats_grad = []
+        self.corr_steps = []  # list of (step, correlation)
         self.config = config
         self.model = None
         self.optimizer = None
@@ -93,6 +94,7 @@ class trainer():
             return
 
         stat_dict_raw, stat_dict_q, stat_dict_deq, stat_dict_grad = {}, {}, {}, {}
+        raw_accum, deq_accum = [], []  # collect for correlation
 
         if not np.isfinite(loss_value):
             print(f"⚠️ Skipping telemetry logging due to non-finite loss at step {step}")
@@ -107,19 +109,25 @@ class trainer():
             if param.requires_grad and 'bias' not in new_name and 'weight' in new_name:
                 w_fp = param.detach().cpu().float().numpy().flatten()
                 if np.isfinite(w_fp).all():
-                    stat_dict_raw[f"Weights/{new_name}/mean"] = np.mean(w_fp)
-                    stat_dict_raw[f"Weights/{new_name}/std"] = np.std(w_fp)
-                    stat_dict_raw[f"Weights/{new_name}/kurtosis"] = scipy.stats.kurtosis(w_fp)
-                    wandb.log({f"Weights/{new_name}/hist": wandb.Histogram(w_fp)}, step=step)
+                    mean = w_fp.mean().item()
+                    std  = w_fp.std().item()
+                    kurtosis = scipy.stats.kurtosis(w_fp)
+                    stat_dict_raw[f"Weights_raw/{new_name}/mean"] = mean
+                    stat_dict_raw[f"Weights_raw/{new_name}/std"] = std
+                    stat_dict_raw[f"Weights_raw/{new_name}/kurtosis"] = kurtosis
+                    wandb.log({f"Weights/{new_name}/hist": wandb.Histogram(w_fp, num_bins=40)}, step=step)
 
             # ---- Log Gradients ----
             if param.requires_grad and param.grad is not None and 'bias' not in new_name and 'weight' in new_name:
                 g = param.grad.detach().cpu().float().numpy().flatten()
                 if np.isfinite(g).all():
-                    stat_dict_grad[f"Gradients/{new_name}/mean"] = np.mean(g)
-                    stat_dict_grad[f"Gradients/{new_name}/std"] = np.std(g)
-                    stat_dict_grad[f"Gradients/{new_name}/kurtosis"] = scipy.stats.kurtosis(g)
-                    wandb.log({f"Gradients/{new_name}/hist": wandb.Histogram(g)}, step=step)
+                    mean = g.mean().item()
+                    std  = g.std().item()
+                    kurtosis = scipy.stats.kurtosis(g)
+                    stat_dict_grad[f"Gradients/{new_name}/mean"] = mean
+                    stat_dict_grad[f"Gradients/{new_name}/std"] = std
+                    stat_dict_grad[f"Gradients/{new_name}/kurtosis"] = kurtosis
+                    wandb.log({f"Gradients/{new_name}/hist": wandb.Histogram(g, num_bins=40)}, step=step)
 
             # ---- Log Quantized Weights ----
             modules_dict = dict(self.model.named_modules())
@@ -159,15 +167,18 @@ class trainer():
                         stat_dict_q[f"Weights_q/{new_name}/mean"] = np.mean(w_q)
                         stat_dict_q[f"Weights_q/{new_name}/std"] = np.std(w_q)
                         stat_dict_q[f"Weights_q/{new_name}/kurtosis"] = scipy.stats.kurtosis(w_q)
-                        wandb.log({f"Weights_q_int/{new_name}/hist": wandb.Histogram(w_q)}, step=step)
+                        wandb.log({f"Weights_q_int/{new_name}/hist": wandb.Histogram(w_q, num_bins=40)}, step=step)
 
                     # dequantized values
                     deq = (q_int.float() * sx).cpu().numpy()
                     if np.isfinite(deq).all():
+                        # accumulate for correlation (keep tensor pairs aligned)
+                        raw_accum.append(w_fp)
                         stat_dict_deq[f"Weights_deq/{new_name}/mean"] = np.mean(deq)
                         stat_dict_deq[f"Weights_deq/{new_name}/std"] = np.std(deq)
                         stat_dict_deq[f"Weights_deq/{new_name}/kurtosis"] = scipy.stats.kurtosis(deq)
-                        wandb.log({f"Weights_deq/{new_name}/hist": wandb.Histogram(deq)}, step=step)
+                        wandb.log({f"Weights_deq/{new_name}/hist": wandb.Histogram(deq, num_bins=40)}, step=step)
+                        deq_accum.append(deq)
                 except Exception as e:
                     print(f"[telemetry] dequant logging failed for {new_name}: {e}")
 
@@ -179,6 +190,14 @@ class trainer():
         self.layer_stats_w_q.append(stat_dict_q)
         self.layer_stats_w_deq.append(stat_dict_deq)
         self.layer_stats_grad.append(stat_dict_grad)
+
+        # ---- Correlation between raw and dequantised ----
+        if raw_accum and deq_accum and len(raw_accum)==len(deq_accum):
+            raw_concat = np.concatenate(raw_accum)
+            deq_concat = np.concatenate(deq_accum)
+            corr = np.corrcoef(raw_concat, deq_concat)[0,1]
+            self.corr_steps.append((step, float(corr)))
+            wandb.log({"weights_raw_deq/corr": corr}, step=step)
 
     def save_layer_stats(self):
         model_key = getattr(self, 'current_model_key', 'model')
@@ -234,6 +253,23 @@ class trainer():
             plot_grid_heatmaps(tensor, layer_names, list(stat_map.keys()), self.config, type_label=type, model_key=self.current_model_key, subfolder=subfolder)
             plot_interactive_3d(tensor, layer_names, list(stat_map.keys()), self.config, type_label=type, model_key=self.current_model_key, subfolder=subfolder)
             print("✅ Plots saved to plot folder")
+
+        # ---- Correlation plot ----
+        if self.corr_steps:
+            import matplotlib.pyplot as plt
+            steps, corrs = zip(*self.corr_steps)
+            base = os.path.join("plots", "correlation", self.current_model_key)
+            os.makedirs(base, exist_ok=True)
+            plt.figure(figsize=(8,4))
+            plt.plot(steps, corrs, marker='o')
+            plt.title("Correlation between Raw and Dequantised Weights")
+            plt.xlabel("Step")
+            plt.ylabel("Pearson r")
+            plt.grid(True)
+            plt.savefig(os.path.join(base, "raw_deq_correlation.png"))
+            plt.close()
+            print("✅ Correlation plot saved")
+
         print("\n task finished \n")
 
     def compute_batch_instance_iou(self, pred_mask, gt_mask):
@@ -320,8 +356,7 @@ class trainer():
                     log_dict["train/instance_iou"] = inst_iou_sum / batches
                 wandb.log(log_dict, step=global_step)
                 self.log_telemetry(loss.item(), global_step)
-            if global_step == step0 + 50:
-                break
+
         avg_dice = dice_sum / max(batches, 1) if task == "semantic" else None
         avg_iou = inst_iou_sum / max(batches, 1) if task == "instance" else None
         return tr_loss / max(batches, 1), avg_dice, avg_iou, global_step
@@ -410,6 +445,7 @@ class trainer():
             self.layer_stats_w_q.clear()
             self.layer_stats_w_deq.clear()
             self.layer_stats_grad.clear()
+            self.corr_steps.clear() # Clear correlation steps for new model
 
             # Initialise W&B run per model if logging enabled
             if self.config.enable_logging:

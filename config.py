@@ -17,10 +17,10 @@ class TrainingConfig:
     # Training parameters
     batch_size: int = 32
     lr: float = 5e-5
-    epochs: int = 2
+    epochs: int = 5
     task: str = "semantic" 
 
-    wandb_name: str = "1st full run" 
+    wandb_name: str = "semantic seg | 5 epochs run" 
     project_name: str = "semantic_segmentation_full_vs_quantized"
 
     # Model parameters
