@@ -1,7 +1,8 @@
-/wandb
+wandb/
 __pycache__/
 **.pth
 coco2017/
+checkpoints/
 plots/val_output/**
 **.pkl
 **.pth
