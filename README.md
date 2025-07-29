@@ -79,7 +79,35 @@ plots/heatmaps/
 2. **GroupNorm weights are special.**  Each weight acts as a scaling factor tied to per-group statistics &mdash; high kurtosis makes them sensitive, so we leave them full-precision.
 3. **The final projection layer stays FP16.**  It maps hidden channels back to pixel space; quantising it hurts mIoU more than it saves latency.
 
----
+## Results 📊
+
+### Semantic Segmentation
+
+#### Weights Heat-map
+
+<p align="center">
+  <img src="results/semantic/fp16_weights.png" alt="FP16 weights heatmap" width="45%"/>
+  <img src="results/semantic/nvfp4_weights.png" alt="NVFP4 weights heatmap" width="45%"/>
+</p>
+
+#### Gradient Heat-map
+<p align="center">
+  <img src="results/semantic/fp16_gradients.png" alt="FP16 gradients heatmap" width="45%"/>
+  <img src="results/semantic/nvfp4_gradients.png" alt="NVFP4 gradients heatmap" width="45%"/>
+</p>
+
+#### Training Curve
+
+![train-loss](results/semantic/train_loss.png)
+
+![train-dice](results/semantic/dice.png)
+
+The quantised run (red) closely tracks the full-precision baseline (green), confirming that the NVFP4 emulation and straight-through training procedure preserve convergence behaviour.
+
+### Instance Segmentation
+
+*(Placeholder for future results. Add visualisations once the instance-level training run is complete.)*
+
 ## Roadmap ✨
 - [ ] Implement native **NVFP4 convolution kernels** so Conv/ConvT layers run quantised end-to-end on GPU.  
 - [ ] Benchmark & analyse **training behaviour with true CUDA GEMM** (no emulation) to validate gradients and convergence.  
@@ -87,3 +115,5 @@ plots/heatmaps/
 - [ ] **Extend the pipeline to object detection** (e.g. RetinaNet / YOLO) and repeat the FP16 vs NVFP4 comparison.
 
 PRs & issues welcome – let’s push FP4 to its limits! 🤖💾 
+
+--- 

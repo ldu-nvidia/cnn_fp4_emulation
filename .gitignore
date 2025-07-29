@@ -3,8 +3,10 @@ __pycache__/
 **.pth
 coco2017/
 checkpoints/
-plots/val_output/**
+plots/
 **.pkl
 **.pth
 **.html
 **.json
+
+
