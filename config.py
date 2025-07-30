@@ -18,10 +18,10 @@ class TrainingConfig:
     batch_size: int = 32
     lr: float = 5e-5
     epochs: int = 5
-    task: str = "semantic" 
+    task: str = "instance" 
 
-    wandb_name: str = "semantic seg | 5 epochs run" 
-    project_name: str = "semantic_segmentation_full_vs_quantized"
+    wandb_name: str = "full run 5 epochs" 
+    project_name: str = "instance_segmentation_full_vs_quantized"
 
     # Model parameters
     models: List[str] = ("nvfp4", "fp16")  # list of model keys to train sequentially
@@ -32,7 +32,7 @@ class TrainingConfig:
     log_weights: bool = True
     log_grads: bool = True
     visualize_val: bool = True
-    seeds: int = 715
+    seeds: int = 618
 
     # Architecture parameter
     model_scale_factor: float = 0.25  # scales base channel counts

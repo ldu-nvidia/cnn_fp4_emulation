@@ -202,11 +202,12 @@ class trainer():
     def save_layer_stats(self):
         model_key = getattr(self, 'current_model_key', 'model')
         base_dir = f"plots/heatmaps/{model_key}"
+        task_prefix = self.config.task  # 'semantic' or 'instance'
         mapping = [
-            ("weights/prequantize", self.layer_stats_w_raw, "semantic_weights.json"),
-            ("weights/quantized",   self.layer_stats_w_q,   "semantic_weights.json"),
-            ("weights/dequantized", self.layer_stats_w_deq, "semantic_weights.json"),
-            ("gradients",           self.layer_stats_grad,  "semantic_gradients.json"),
+             ("weights/prequantize", self.layer_stats_w_raw, f"{task_prefix}_weights.json"),
+             ("weights/quantized",   self.layer_stats_w_q,   f"{task_prefix}_weights.json"),
+             ("weights/dequantized", self.layer_stats_w_deq, f"{task_prefix}_weights.json"),
+             ("gradients",           self.layer_stats_grad,  f"{task_prefix}_gradients.json"),
         ]
 
         for sub, layer_stats, fname in mapping:
