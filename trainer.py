@@ -18,7 +18,7 @@ from torch.amp.grad_scaler import GradScaler
 import scipy.stats
 import json
 from kitchen.quantization_autograd import quantize as kitchen_quantize
-from data import CocoSegmentationDataset
+from data import CocoSegmentationDataset, MVTecSegmentationDataset
 from config import configs
 import pickle
 from dataclasses import asdict
@@ -34,7 +34,7 @@ from utils import (rename, parse_segmentation_masks, parse_instance_masks, parse
         get_coco, get_max_instances_from_annotations, plot_grid_heatmaps, plot_interactive_3d, dice_coeff, \
             save_predictions_for_visualization, miou, instance_iou)
 
-from loss import DiceLoss, instance_loss
+from loss import instance_loss
 
 SEED = 911    # pick any integer you like ────────────────┐
 torch.manual_seed(SEED)       # <- torch CPU ops                │
@@ -308,7 +308,7 @@ class trainer():
 
     def train_one_epoch(self, train_loader, device, global_step, task, num_cls):
         self.model.train()
-        tr_loss, dice_sum, inst_iou_sum, batches = 0.0, 0.0, 0.0, 0
+        tr_loss, miou_sum, inst_iou_sum, batches = 0.0, 0.0, 0.0, 0
         step0 = global_step
         for imgs, tgts in train_loader:
             imgs = imgs.to(device)
@@ -317,11 +317,21 @@ class trainer():
                 H, W = outs.shape[2:]
 
                 if task == "semantic":
-                    gt = parse_segmentation_masks(tgts, H, W, num_cls, self.cat2idx).to(device)
-                    loss = combined_loss(outs, gt, self.ce_loss, self.dice_loss)
+                    # Support COCO-style (list of annotations) and MVTec-style (integer tensor)
+                    if isinstance(tgts, list):
+                        gt_one_hot = parse_segmentation_masks(tgts, H, W, num_cls, self.cat2idx).to(device)
+                        loss = combined_loss(outs, gt_one_hot, self.ce_loss)
+                        gt_lbl = gt_one_hot.argmax(1)
+                    else:
+                        gt_lbl = tgts.to(device).long()
+                        loss = combined_loss(outs, gt_lbl, self.ce_loss)
                     preds = outs.argmax(1)
-                    gt_lbl = gt.argmax(1)
-                    dice_sum += dice_coeff(preds.cpu(), gt_lbl.cpu())
+                    miou_sum += jaccard_index(
+                        preds, gt_lbl,
+                        num_classes=num_cls,
+                        task='multiclass',
+                        average='micro'
+                    ).item()
 
                 elif task == "instance":
                     masks, _ = parse_instance_masks(tgts, H, W, self.cat2idx)
@@ -352,22 +362,22 @@ class trainer():
             if self.config.enable_logging and global_step % self.config.logf == 0:
                 log_dict = {"train/loss": loss.item()}
                 if task == "semantic":
-                    log_dict["train/dice"] = dice_sum / batches
+                    log_dict["train/miou"] = miou_sum / batches
                 if task == "instance":
                     log_dict["train/instance_iou"] = inst_iou_sum / batches
                 wandb.log(log_dict, step=global_step)
                 self.log_telemetry(loss.item(), global_step)
 
-        avg_dice = dice_sum / max(batches, 1) if task == "semantic" else None
+        avg_miou = miou_sum / max(batches, 1) if task == "semantic" else None
         avg_iou = inst_iou_sum / max(batches, 1) if task == "instance" else None
-        return tr_loss / max(batches, 1), avg_dice, avg_iou, global_step
+        return tr_loss / max(batches, 1), avg_miou, avg_iou, global_step
 
     # ------------------------ Validation --------------------------------
     def validate(self, loader, ce, dice_loss,
                 dev, step0, task, num_cls):
         self.model.eval()
         print("validating")
-        total_loss = dice_sum = miou_sum = inst_iou_sum = 0.0
+        total_loss = miou_sum = inst_iou_sum = 0.0
         step    = step0
         batches = 0
 
@@ -378,14 +388,17 @@ class trainer():
                     outs = self.model(imgs)                         # [B,C,H,W]
                     H, W = outs.shape[2:]
                     if task == "semantic":
-                        gt   = parse_segmentation_masks(
-                                tgts, H, W, num_cls, self.cat2idx).to(dev)
-                        batch_loss = combined_loss(outs, gt, ce, dice_loss)
+                        if isinstance(tgts, list):
+                            gt_one_hot = parse_segmentation_masks(
+                                    tgts, H, W, num_cls, self.cat2idx).to(dev)
+                            batch_loss = combined_loss(outs, gt_one_hot, ce)
+                            gt_lbl  = gt_one_hot.argmax(1)
+                        else:
+                            gt_lbl = tgts.to(dev).long()
+                            batch_loss = combined_loss(outs, gt_lbl, ce)
                         total_loss += batch_loss.item()
 
                         preds   = outs.argmax(1)               # still on GPU
-                        gt_lbl  = gt.argmax(1)
-                        dice_sum += dice_coeff(preds.cpu(), gt_lbl.cpu())
                         miou_sum += jaccard_index(
                                         preds, gt_lbl,
                                         num_classes=num_cls,
@@ -416,13 +429,12 @@ class trainer():
 
         # ---- average metrics -----------------------------------------------
         loss   = total_loss / max(batches, 1)
-        dice_av = dice_sum   / max(batches, 1)
         miou_av = miou_sum   / max(batches, 1)
         inst_av = inst_iou_sum / max(batches, 1)
 
         if self.config.enable_logging:
             if task == "semantic":
-                wandb.log({"val/dice": dice_av, "val/miou": miou_av}, step=step)
+                wandb.log({"val/miou": miou_av}, step=step)
             elif task == "instance":
                 wandb.log({"val/instance_iou": inst_av}, step=step)
             wandb.log({"val/loss": loss}, step = step)
@@ -457,46 +469,75 @@ class trainer():
 
             # dataset and loaders constructed only once outside loop (reuse) ----------------
             if not hasattr(self, "_data_prepared"):
-                cache_path = "cat2idx_cache.pkl"
-                if os.path.exists(cache_path):
-                    print("Loading cached cat2idx dictionary...")
-                    with open(cache_path, "rb") as f:
-                        self.cat2idx = pickle.load(f)
-                else:
-                    print("Computing and caching cat2idx dictionary...")
-                    coco = get_coco(self.config.ann_file)
-                    cat_ids = sorted(coco.getCatIds())
-                    self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
-                    with open(cache_path, "wb") as f:
-                        pickle.dump(self.cat2idx, f)
+                if getattr(self.config, 'dataset_type', 'mvtec') == 'coco':
+                    cache_path = "cat2idx_cache.pkl"
+                    if os.path.exists(cache_path):
+                        print("Loading cached cat2idx dictionary...")
+                        with open(cache_path, "rb") as f:
+                            self.cat2idx = pickle.load(f)
+                    else:
+                        print("Computing and caching cat2idx dictionary...")
+                        coco = get_coco(self.config.ann_file)
+                        cat_ids = sorted(coco.getCatIds())
+                        self.cat2idx = {cid: i for i, cid in enumerate(cat_ids)}
+                        with open(cache_path, "wb") as f:
+                            pickle.dump(self.cat2idx, f)
 
-                dataset = CocoSegmentationDataset(
-                    img_root=self.config.coco_root,
-                    ann_file=self.config.ann_file,
-                    category_id_to_class_idx=self.cat2idx,
-                    target_size=(256, 256))
+                    dataset = CocoSegmentationDataset(
+                        img_root=self.config.coco_root,
+                        ann_file=self.config.ann_file,
+                        category_id_to_class_idx=self.cat2idx,
+                        target_size=(256, 256))
 
-                if self.config.task == "semantic":
-                    num_cls, num_inst = len(self.cat2idx), -1
-                elif self.config.task == "instance":
-                    num_inst = get_max_instances_from_annotations(self.config.ann_file)
-                    num_cls = len(self.cat2idx)
-                    print(f"Max instances / image = {num_inst}")
-                else:
-                    raise ValueError("Unsupported task type")
+                    if self.config.task == "semantic":
+                        num_cls, num_inst = len(self.cat2idx), -1
+                    elif self.config.task == "instance":
+                        num_inst = get_max_instances_from_annotations(self.config.ann_file)
+                        num_cls = len(self.cat2idx)
+                        print(f"Max instances / image = {num_inst}")
+                    else:
+                        raise ValueError("Unsupported task type")
 
-                val_frac = 0.001
-                val_len = int(val_frac * len(dataset))
-                train_len = len(dataset) - val_len
-                train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=g)
+                    val_frac = 0.001
+                    val_len = int(val_frac * len(dataset))
+                    train_len = len(dataset) - val_len
+                    train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=g)
 
-                self.train_loader = DataLoader(train_set, batch_size=self.config.batch_size, shuffle=True,
-                    num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
-                    generator=g, worker_init_fn=seed_worker)
+                    self.train_loader = DataLoader(train_set, batch_size=self.config.batch_size, shuffle=True,
+                        num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
+                        generator=g, worker_init_fn=seed_worker)
 
-                self.val_loader = DataLoader(val_set, batch_size=self.config.batch_size, shuffle=False,
-                    num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
-                    generator=g, worker_init_fn=seed_worker)
+                    self.val_loader = DataLoader(val_set, batch_size=self.config.batch_size, shuffle=False,
+                        num_workers=4, pin_memory=True, collate_fn=coco_collate_fn,
+                        generator=g, worker_init_fn=seed_worker)
+                else:  # MVTec AD style
+                    dataset = MVTecSegmentationDataset(
+                        root_dir=self.config.mvtec_root,
+                        subset=self.config.mvtec_subset,
+                        categories=self.config.mvtec_categories if self.config.mvtec_categories else None,
+                        task_mode=self.config.mvtec_task_mode,
+                        target_size=(256, 256),
+                    )
+                    # For semantic segmentation: output channels equal to number of classes
+                    if self.config.task != 'semantic':
+                        raise ValueError("For MVTec dataset, set task='semantic' (binary or per-defect).")
+                    num_cls = dataset.num_classes
+                    num_inst = -1
+                    # Optional mapping for visualisation
+                    self.cat2idx = getattr(dataset, 'class_to_index', {"background": 0})
+
+                    val_frac = 0.1
+                    val_len = max(1, int(val_frac * len(dataset)))
+                    train_len = len(dataset) - val_len
+                    train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=g)
+
+                    # Default collation works: returns images [B,3,H,W] and labels [B,H,W]
+                    self.train_loader = DataLoader(train_set, batch_size=self.config.batch_size, shuffle=True,
+                        num_workers=4, pin_memory=True,
+                        generator=g, worker_init_fn=seed_worker)
+                    self.val_loader = DataLoader(val_set, batch_size=self.config.batch_size, shuffle=False,
+                        num_workers=4, pin_memory=True,
+                        generator=g, worker_init_fn=seed_worker)
 
                 self._data_prepared = True  # flag
 
@@ -512,7 +553,6 @@ class trainer():
             self.scaler = GradScaler(device="cuda")
 
             self.ce_loss = nn.CrossEntropyLoss()
-            self.dice_loss = DiceLoss()
 
             global_step = 0
             for epoch in range(self.config.epochs):

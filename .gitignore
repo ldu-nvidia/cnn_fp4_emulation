@@ -8,5 +8,5 @@ plots/
 **.pth
 **.html
 **.json
-
+data/*
 

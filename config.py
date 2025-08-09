@@ -11,14 +11,21 @@ import torch
 class TrainingConfig:
     """Configuration class for training parameters."""
     # Data parameters
+    dataset_type: str = "mvtec"  # {'mvtec','coco'}
+    # COCO
     coco_root: str = "coco2017/train2017"
     ann_file: str = "coco2017/annotations/instances_train2017.json"
+    # MVTec AD
+    mvtec_root: str = "cnn_fp4_emulation/data"
+    mvtec_subset: str = "test"  # {'train','test','all'}
+    mvtec_task_mode: str = "binary"  # {'binary','per-defect'}
+    mvtec_categories: Optional[List[str]] = None
     
     # Training parameters
     batch_size: int = 32
     lr: float = 5e-5
     epochs: int = 5
-    task: str = "instance" 
+    task: str = "semantic" 
 
     wandb_name: str = "full run 5 epochs" 
     project_name: str = "instance_segmentation_full_vs_quantized"
@@ -43,6 +50,10 @@ class TrainingConfig:
         """Validate configuration after initialization."""
         if self.task not in ['semantic', 'instance', 'detection']:
             raise ValueError(f"Invalid task: {self.task}. Must be one of: semantic, instance, detection")
+        if self.dataset_type not in {"mvtec", "coco"}:
+            raise ValueError("dataset_type must be 'mvtec' or 'coco'")
+        if self.dataset_type == "mvtec" and self.task != "semantic":
+            raise ValueError("For MVTec dataset, set task='semantic' (binary or per-defect via mvtec_task_mode)")
         
         if self.batch_size <= 0:
             raise ValueError(f"Batch size must be positive, got: {self.batch_size}")
@@ -64,12 +75,20 @@ def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Training configuration for CNN FP4 emulation")
     
     # Data parameters
+    parser.add_argument('--dataset_type', type=str, choices=['mvtec','coco'], default=TrainingConfig.dataset_type)
+    # COCO
     parser.add_argument('--coco_root', type=str, 
                        help='Path to COCO images folder', 
                        default=TrainingConfig.coco_root)
     parser.add_argument('--ann_file', type=str, 
                        help='Path to COCO annotation file', 
                        default=TrainingConfig.ann_file)
+    # MVTec AD
+    parser.add_argument('--mvtec_root', type=str, default=TrainingConfig.mvtec_root)
+    parser.add_argument('--mvtec_subset', type=str, choices=['train','test','all'], default=TrainingConfig.mvtec_subset)
+    parser.add_argument('--mvtec_task_mode', type=str, choices=['binary','per-defect'], default=TrainingConfig.mvtec_task_mode)
+    parser.add_argument('--mvtec_categories', type=str, nargs='*', default=None,
+                        help='Optional list of categories to include (default: all found)')
     
     # Training parameters
     parser.add_argument('--batch_size', type=int, default=TrainingConfig.batch_size)
@@ -103,8 +122,13 @@ def parse_args() -> TrainingConfig:
     args = parser.parse_args()
     
     return TrainingConfig(
+        dataset_type=args.dataset_type,
         coco_root=args.coco_root,
         ann_file=args.ann_file,
+        mvtec_root=args.mvtec_root,
+        mvtec_subset=args.mvtec_subset,
+        mvtec_task_mode=args.mvtec_task_mode,
+        mvtec_categories=args.mvtec_categories,
         batch_size=args.batch_size,
         lr=args.lr,
         epochs=args.epochs,

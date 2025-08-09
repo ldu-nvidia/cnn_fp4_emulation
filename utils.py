@@ -170,12 +170,23 @@ def count_parameters(model):
     print(f"Trainable parameters: {trainable:,}")
     return total, trainable
 
-def combined_loss(logits, targets, ce_criterion, dice_criterion):
-    assert targets.ndim == 4, f"Expected targets [B, C, H, W], got {targets.shape}"
-    ce_targets = torch.argmax(targets, dim=1)
-    ce_loss = ce_criterion(logits, ce_targets)
-    dice_loss = dice_criterion(logits, targets)
-    return 0.7 * ce_loss + 0.3 * dice_loss
+def combined_loss(logits, targets, ce_criterion):
+    """Unified loss for semantic segmentation.
+
+    Supports two target formats:
+      - one-hot: FloatTensor [B,C,H,W]
+      - integer labels: LongTensor [B,H,W]
+    """
+    if targets.ndim == 4:
+        # One-hot
+        ce_targets = torch.argmax(targets, dim=1)
+        ce_loss = ce_criterion(logits, ce_targets)
+    elif targets.ndim == 3:
+        # Integer labels
+        ce_loss = ce_criterion(logits, targets)
+    else:
+        raise AssertionError(f"Unsupported targets shape: {targets.shape}")
+    return ce_loss
 
 def save_visual_predictions(images, targets, preds, config, task, num_classes, category_id_to_class_idx, save_prefix="train_step"):
     height, width = preds.shape[1:]
@@ -226,7 +237,6 @@ def log_visual_predictions_to_file(
     # Use only the last batch from the dataloader
     images, targets = list(dataloader)[-1]
     assert isinstance(images, torch.Tensor)
-    assert isinstance(targets, list)
 
     images = images.to(device)
     with torch.no_grad():
@@ -248,8 +258,11 @@ def log_visual_predictions_to_file(
             plt.close(fig)
 
     else:  # semantic segmentation
-        gt_masks = parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx)
-        gt_masks = gt_masks.argmax(1).cpu()
+        if isinstance(targets, list):
+            gt_masks = parse_segmentation_masks(targets, height, width, num_classes, category_id_to_class_idx)
+            gt_masks = gt_masks.argmax(1).cpu()
+        else:
+            gt_masks = targets.cpu()
         for i in range(B):
             img_np = to_pil_image(images[i].cpu())
             pred_mask = preds[i].numpy()
@@ -431,7 +444,12 @@ def save_predictions_for_visualization(model, val_loader, device, task, cat2idx,
                 H, W = outs.shape[2:]
 
                 if task == "semantic":
-                    gt = parse_segmentation_masks([tgts[i]], H, W, len(cat2idx), cat2idx).argmax(1)[0]
+                    if isinstance(tgts, list):
+                        # COCO path: build from annotations
+                        gt = parse_segmentation_masks([tgts[i]], H, W, len(cat2idx), cat2idx).argmax(1)[0]
+                    else:
+                        # MVTec path: integer mask [H,W]
+                        gt = tgts[i].cpu()
                     pred = preds[i].cpu()
 
                     gt_masks = [(gt == k) for k in gt.unique() if k.item() > 0]
